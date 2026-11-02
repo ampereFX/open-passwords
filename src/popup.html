@@ -78,6 +78,24 @@
         <span>Enter the pairing code for me<span id="autopair-note" class="subnote"></span></span>
         <input type="checkbox" id="autopair-toggle" class="switch" />
       </label>
+
+      <!-- Everything the extension did, in order, with secrets redacted. The place to
+           start when a fill silently does nothing on one specific site. -->
+      <details id="diag" class="diag">
+        <summary>Diagnostics</summary>
+        <p id="diag-summary" class="subnote">Loading…</p>
+        <p id="diag-error" class="subnote diag-error"></p>
+        <div class="diag-actions">
+          <button id="diag-copy" class="link">Copy</button>
+          <button id="diag-export" class="link">Export .json</button>
+          <button id="diag-clear" class="link">Clear</button>
+        </div>
+        <label class="switch-row compact">
+          <span>Record everything (verbose)<span class="subnote">debug-level detail, per focus and per native call</span></span>
+          <input type="checkbox" id="verbose-toggle" class="switch" />
+        </label>
+        <p id="diag-note" class="subnote"></p>
+      </details>
     </footer>
 
     <script type="module" src="popup.js"></script>

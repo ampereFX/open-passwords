@@ -4,6 +4,9 @@ set -e
 DIR="$(cd "$(dirname "$0")" && pwd)"
 EXT_ID="pejdijmoenmkgeppbflobdenhhabjlaj" # the ID our manifest key forces
 SUPPORT="$HOME/Library/Application Support"
+# helper diagnostics live here, outside the repo, so they survive a re-clone
+LOGDIR="$HOME/Library/Logs/OpenPasswords"
+mkdir -p "$LOGDIR"
 
 # outside the repo so moving it wont break the host path, and out of ~/Downloads where TCC can block the browser launching it
 APPDIR="$SUPPORT/OpenPasswords"
@@ -85,4 +88,5 @@ done
 
 echo
 echo "Helper installed to $HELPER ($found browser(s))"
+echo "Helper logs: $LOGDIR (policy.log, autopair.log; rotated at 256 KB)"
 echo "Now FULLY QUIT and reopen your browser (Cmd+Q), then use the popup toggle."

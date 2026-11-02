@@ -1,5 +1,63 @@
 // OTP inputs are never fillable login fields, that misclassification is apple's balloon-on-every-OTP bug
-console.log("[Open Passwords] content script v0.49.0 loaded");
+
+// --- diagnostics -----------------------------------------------------------------
+// A classic content script cannot import log.js, so this is a thin producer: it posts
+// events to the worker, which owns the buffer and applies the redaction whitelist.
+// Never put a field value in here, only shape, counts and decisions.
+const OP_BUILD = "0.50.0";
+let opTraceSeq = 0;
+let opTrace = "boot";
+let opQueue = [];
+let opFlushTimer = null;
+
+// same masking as log.js::maskUser, content scripts cannot import modules
+function opMask(u) {
+  const s = String(u ?? "");
+  if (!s) return "";
+  const at = s.indexOf("@");
+  const local = at > 0 ? s.slice(0, at) : s;
+  const domain = at > 0 ? s.slice(at) : "";
+  if (local.length <= 1) return `*${domain}`;
+  return `${local[0]}${"•".repeat(Math.min(6, Math.max(1, local.length - 2)))}${local.slice(-1)}${domain}`;
+}
+
+function newTrace(what) {
+  opTraceSeq += 1;
+  return `${what || "e"}-${opTraceSeq.toString(36)}-${Math.random().toString(36).slice(2, 6)}`;
+}
+
+function opFlush() {
+  opFlushTimer = null;
+  if (!opQueue.length) return;
+  const events = opQueue;
+  opQueue = [];
+  try {
+    chrome.runtime.sendMessage({ type: "log", events }).catch(() => {});
+  } catch (_) {}
+}
+
+function opLog(t, lvl, d, extra) {
+  opQueue.push({ t, lvl, d, trace: (extra && extra.trace) || opTrace });
+  // a fill decision is worth an immediate round trip, a focus is not
+  if (lvl === "warn" || lvl === "error" || opQueue.length >= 30) {
+    clearTimeout(opFlushTimer);
+    opFlush();
+    return;
+  }
+  if (!opFlushTimer) opFlushTimer = setTimeout(opFlush, 25);
+}
+
+// our own exceptions must not disappear into the page console
+window.addEventListener("error", (e) => {
+  opLog("content.error", "warn", {
+    msg: String(e.message || "").slice(0, 160),
+    src: String(e.filename || "").slice(0, 100),
+    line: e.lineno,
+  });
+});
+window.addEventListener("unhandledrejection", (e) => {
+  opLog("content.rejection", "warn", { err: String(e.reason?.message ?? e.reason ?? "").slice(0, 160) });
+});
 
 const OTP_AUTOCOMPLETE = /one-time-code/i;
 const OTP_HINT = /\b(otp|one[\s-]?time|verification|2fa|mfa|sms[\s-]?code|auth[\s-]?code|security[\s-]?code|passcode)\b/i;
@@ -145,22 +203,33 @@ function isFillable(el) {
   return true;
 }
 
-function fillCredentials(username, password, anchor) {
+// report is filled in for the log: what the page had, what was picked and why
+function fillCredentials(username, password, anchor, report = {}) {
   const pool = new Set(document.querySelectorAll("input"));
   const root = anchor?.getRootNode?.();
   if (root && root !== document && root.querySelectorAll) {
     for (const i of root.querySelectorAll("input")) pool.add(i);
   }
-  const inputs = Array.from(pool).filter(isFillable);
+  const all = Array.from(pool);
+  const inputs = all.filter(isFillable);
   let passwords = inputs.filter(isPasswordField);
   let usernames = inputs.filter(isUsernameField);
 
+  report.inputs = all.length;
+  report.fillable = inputs.length;
+  report.passwords = passwords.length;
+  report.usernames = usernames.length;
+  report.hiddenPw = passwords.filter((p) => !isVisible(p)).length;
+
   const anchorForm = anchor && anchor.form;
+  report.anchor = anchor ? fieldInfo(anchor) : null;
+  report.anchorForm = !!anchorForm;
   if (anchorForm) {
     const pwInForm = passwords.filter((p) => p.form === anchorForm);
     const userInForm = usernames.filter((u) => u.form === anchorForm);
     if (pwInForm.length) passwords = pwInForm;
     if (userInForm.length) usernames = userInForm;
+    report.passwordsInForm = passwords.length;
   }
 
   let firstPw = passwords[0];
@@ -181,6 +250,9 @@ function fillCredentials(username, password, anchor) {
       }
     }
   }
+
+  report.userTarget = userTarget ? fieldInfo(userTarget) : null;
+  report.pwTarget = firstPw ? fieldInfo(firstPw) : null;
 
   let filled = false;
   if (userTarget) {
@@ -204,14 +276,25 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
   if (msg?.type !== "fill") return false;
   // host must match the origin the background pinned the cred to, so site A's cred never lands on site B
   if (sender.id !== chrome.runtime.id) {
+    opLog("fill.reject", "warn", { why: "foreign sender" });
     sendResponse({ ok: false, filled: false, error: "forbidden" });
     return true;
   }
   if (msg.expectedHost && location.hostname.toLowerCase() !== msg.expectedHost) {
+    opLog("fill.reject", "warn", { why: "origin mismatch", expectedHost: msg.expectedHost, here: location.hostname });
     sendResponse({ ok: false, filled: false, error: "origin mismatch" });
     return true;
   }
-  const filled = fillCredentials(msg.username, msg.password, liveField(fillAnchor));
+  const report = {};
+  const anchor = liveField(fillAnchor);
+  const filled = fillCredentials(msg.username, msg.password, anchor, report);
+  report.anchorRelookup = !!fillAnchor && anchor !== fillAnchor;
+  opLog(filled ? "fill.run" : "fill.run.empty", filled ? "info" : "warn", {
+    gotUser: !!msg.username,
+    gotPw: !!msg.password,
+    pwLen: String(msg.password || "").length,
+    ...report,
+  });
   // a submit right after must not re-offer to save this existing login
   if (filled) lastAutofill = { host: location.hostname, username: msg.username, password: msg.password, at: Date.now() };
   sendResponse({ ok: true, filled });
@@ -223,12 +306,17 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
   switch (msg?.type) {
     case "fillOtp": {
       if (msg.expectedHost && location.hostname.toLowerCase() !== msg.expectedHost) {
+        opLog("otp.reject", "warn", { why: "origin mismatch", expectedHost: msg.expectedHost, here: location.hostname });
         sendResponse({ ok: false, filled: false, error: "origin mismatch" });
         return true;
       }
       // a frame with no code field stays silent so another frame's answer wins
       const target = otpTargetField();
-      if (!target) return false;
+      if (!target) {
+        opLog("otp.no-target", "debug", { codeLen: String(msg.code || "").length });
+        return false;
+      }
+      opLog("otp.fill", "info", { codeLen: String(msg.code || "").length, field: fieldInfo(target), anchorHit: liveField(otpAnchor) === target });
       fillOtp(target, msg.code);
       sendResponse({ ok: true, filled: true });
       return true;
@@ -241,11 +329,13 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
       return false;
     }
     case "shortcut": {
+      opLog("shortcut", "info", { top: window === window.top });
       onShortcut();
       return false;
     }
     case "unlocked": {
       // auto-pair opened the vault while the inline PIN box was up
+      opLog("unlock.push", "info", { hadBox: !!suggestionEl, resumable: typeof lockedResume === "function" });
       if (suggestionEl && typeof lockedResume === "function") lockedResume();
       return false;
     }
@@ -272,32 +362,69 @@ let cachedLogins = null;
 let navItems = [];
 let navIndex = -1;
 
-function isLoginField(el) {
-  if (!isVisible(el)) return false;
+// same decision as isLoginField, but it says which rule fired. This is the one answer
+// every "the dropdown never appeared here" report actually needs.
+function explainLoginField(el) {
+  if (!isVisible(el)) return { ok: false, reason: "not_visible" };
 
-  if (isPasswordField(el)) return true;
+  if (isPasswordField(el)) return { ok: true, reason: "password_field" };
 
-  if (!isUsernameField(el)) return false;
+  if (!isUsernameField(el)) {
+    const reason = isOtpField(el) ? "otp_field" : isSearchOrComboField(el) ? "search_or_combo" : "not_username";
+    return { ok: false, reason };
+  }
 
   const form = el.form;
   const ac = (el.getAttribute("autocomplete") || "").toLowerCase();
 
   // explicit autocomplete=username is intentional even when the password lives in another form
-  if (ac.includes("username")) return true;
+  if (ac.includes("username")) return { ok: true, reason: "autocomplete_username" };
 
   // beats autocomplete=off, which banks (wells fargo) set to block autofill, chrome/1password ignore it too
-  if (form && Array.from(form.querySelectorAll("input")).some(isPasswordField)) return true;
+  if (form && Array.from(form.querySelectorAll("input")).some(isPasswordField))
+    return { ok: true, reason: "password_field_in_form" };
 
   const formOptedOut = form && (form.getAttribute("autocomplete") || "").toLowerCase() === "off";
-  if (formOptedOut) return false;
+  if (formOptedOut) return { ok: false, reason: "form_autocomplete_off" };
 
   // without this it fires on tag/search/newsletter boxes
-  if (pageHasVisiblePassword(el)) return true;
+  if (pageHasVisiblePassword(el)) return { ok: true, reason: "visible_password_on_page" };
 
   // two-step first page, no password anywhere yet
-  if (hasStrongIdentitySignal(el) && loginishContext(el)) return true;
+  if (hasStrongIdentitySignal(el) && loginishContext(el)) return { ok: true, reason: "identity_signal_in_login_context" };
 
-  return false;
+  if (hasStrongIdentitySignal(el)) return { ok: false, reason: "no_login_context" };
+  return { ok: false, reason: "weak_identity_signal" };
+}
+
+function isLoginField(el) {
+  return explainLoginField(el).ok;
+}
+
+// shape only: no value, no label text, nothing a page could not already read
+function fieldInfo(el) {
+  if (!(el instanceof HTMLInputElement)) {
+    return { tag: String(el?.tagName || "?").toLowerCase() };
+  }
+  const cut = (s, n = 40) => {
+    s = String(s ?? "");
+    return s.length > n ? `${s.slice(0, n)}…` : s;
+  };
+  return {
+    type: el.type,
+    name: cut(el.name),
+    id: cut(el.id),
+    ac: cut(el.getAttribute("autocomplete") || ""),
+    ph: cut(el.placeholder || ""),
+    ml: el.getAttribute("maxlength") || undefined,
+    im: el.inputMode || undefined,
+    role: cut(el.getAttribute("role") || "") || undefined,
+    vis: isVisible(el),
+    fillable: isFillable(el),
+    hasValue: !!el.value,
+    inForm: !!el.form,
+    shadow: !!(el.getRootNode && el.getRootNode() !== document),
+  };
 }
 
 function removeSuggestion() {
@@ -523,16 +650,26 @@ async function buildLockedSuggestion(field, onUnlock) {
   });
   again.addEventListener("mousedown", (e) => e.stopPropagation());
   again.addEventListener("click", async () => {
+    const trace = newTrace("newcode");
+    opTrace = trace;
     setStatus("Asking your Mac for a new code...", false);
     input.value = "";
-    await chrome.runtime.sendMessage({ type: "requestChallenge" }).catch(() => {});
+    opLog("challenge.again", "info", { anchor: fieldInfo(field) }, { trace });
+    chrome.runtime
+      .sendMessage({ type: "requestChallenge", trace })
+      .then((r) => opLog("challenge.again.res", r?.ok ? "info" : "warn", { ok: r?.ok, error: r?.error, state: r?.state }, { trace }))
+      .catch((e) => opLog("challenge.again.failed", "error", { err: String(e?.message ?? e) }, { trace }));
     setStatus("Enter the new code on your Mac", false);
     input.focus();
   });
   box.appendChild(again);
 
   // a second prompt would invalidate the code the user is reading
-  chrome.runtime.sendMessage({ type: "requestChallenge", ifNeeded: true }).catch(() => {});
+  opLog("pinbox.open", "info", { anchor: fieldInfo(field), viaGenerator: typeof onUnlock === "function" });
+  chrome.runtime
+    .sendMessage({ type: "requestChallenge", ifNeeded: true })
+    .then((r) => opLog("challenge.ifneeded.res", r?.ok ? "debug" : "warn", { ok: r?.ok, error: r?.error, state: r?.state, hasChallenge: r?.hasChallenge }))
+    .catch((e) => opLog("challenge.ifneeded.failed", "warn", { err: String(e?.message ?? e) }));
 
   // also reached from the background's "unlocked" message via lockedResume
   const finishUnlock = async () => {
@@ -543,12 +680,20 @@ async function buildLockedSuggestion(field, onUnlock) {
       return;
     }
     cachedLogins = null;
-    const r2 = await chrome.runtime.sendMessage({ type: "inlineLogins" }).catch(() => null);
+    opLog("unlock.resume", "info", { target: typeof onUnlock === "function" ? "otp" : "logins" });
+    const r2 = await chrome.runtime.sendMessage({ type: "inlineLogins" }).catch((e) => {
+      opLog("unlock.resume.failed", "warn", { err: String(e?.message ?? e) });
+      return null;
+    });
     cachedLogins = r2?.logins || [];
+    opLog("unlock.resume.logins", "debug", { n: cachedLogins.length });
     if (cachedLogins.length === 1) {
       removeSuggestion();
       fillAnchor = field;
-      chrome.runtime.sendMessage({ type: "inlineFill", loginName: cachedLogins[0] }).catch(() => {});
+      chrome.runtime
+        .sendMessage({ type: "inlineFill", loginName: cachedLogins[0], trace: opTrace })
+        .then((r) => opLog("unlock.autofill", r?.filled ? "info" : "warn", { ok: r?.ok, filled: r?.filled, error: r?.error }))
+        .catch(() => {});
     } else if (cachedLogins.length > 1) {
       buildChooser(field, cachedLogins);
     } else {
@@ -563,16 +708,22 @@ async function buildLockedSuggestion(field, onUnlock) {
     const pin = input.value.trim();
     if (pin.length < 4) return;
     verifying = true;
+    const trace = newTrace("pin");
+    opTrace = trace;
     setStatus("Verifying...", false);
+    // the PIN itself never leaves this function unredacted
+    opLog("pin.submit", "info", { pinLen: pin.length }, { trace });
     let res;
     try {
-      res = await chrome.runtime.sendMessage({ type: "verifyPin", pin });
+      res = await chrome.runtime.sendMessage({ type: "verifyPin", pin, trace });
     } catch (err) {
       verifying = false;
+      opLog("pin.send.failed", "error", { err: String(err?.message ?? err) }, { trace });
       setStatus("Verification failed, try again", true);
       return;
     }
     verifying = false;
+    opLog("pin.result", res?.ok ? "info" : "warn", { ok: res?.ok, state: res?.state, error: res?.error, newCode: res?.newCode }, { trace });
     if (res?.ok && res.state === "unlocked") {
       finishUnlock();
     } else {
@@ -672,6 +823,13 @@ function fillGeneratedPassword(field, pw) {
     if (p.form && field.form && p.form !== field.form) continue;
     targets.add(p);
   }
+  opLog("generator.fill", targets.has(field) && !isPasswordField(field) ? "warn" : "info", {
+    targets: targets.size,
+    // true here means the generated password went into a non-password field
+    anchorIsPassword: isPasswordField(field),
+    anchor: fieldInfo(field),
+    pwLen: String(pw || "").length,
+  });
   for (const t of targets) {
     setValue(t, pw);
     everPassword.add(t);
@@ -692,9 +850,23 @@ function appendLoginRows(box, field, logins) {
       textOverflow: "ellipsis",
     });
     registerRow(row, () => {
+      const trace = newTrace("pick");
+      opTrace = trace;
+      opLog("pick.login", "info", { user: opMask(login.username) || "(none)", userLen: String(login.username || "").length, anchor: fieldInfo(field) }, { trace });
       removeSuggestion();
       fillAnchor = field;
-      chrome.runtime.sendMessage({ type: "inlineFill", loginName: login });
+      chrome.runtime
+        .sendMessage({ type: "inlineFill", loginName: login, trace })
+        .then((r) => {
+          // the dropdown is already gone by now, so this reply is the only feedback there is
+          opLog(
+            r && r.ok === false ? "pick.login.failed" : r && r.filled ? "pick.login.filled" : "pick.login.empty",
+            r && (r.ok === false || !r.filled) ? "warn" : "info",
+            { res: r ? { ok: r.ok, filled: r.filled, error: r.error, state: r.state } : "(no response)" },
+            { trace },
+          );
+        })
+        .catch((e) => opLog("pick.login.failed", "error", { err: String(e?.message ?? e) }, { trace }));
     });
     box.appendChild(row);
   }
@@ -726,6 +898,10 @@ function appendGeneratorOptions(box, field, separatorAbove) {
     });
     item.append(label, preview);
     registerRow(item, () => {
+      const trace = newTrace("gen");
+      opTrace = trace;
+      // note the anchor: a generator row on a username field writes the password there
+      opLog("pick.generator", "info", { variant: opt.label, anchor: fieldInfo(field), anchorIsPassword: isPasswordField(field) }, { trace });
       fillGeneratedPassword(field, opt.value);
       removeSuggestion();
     });
@@ -744,19 +920,35 @@ let offerSeq = 0;
 
 // fetch before building so an empty result never flashes a box on then off
 async function buildOfferSuggestion(field) {
+  const trace = newTrace("offer");
+  opTrace = trace;
   const hasGenerator = isNewPasswordField(field);
   const seq = ++offerSeq;
+  const verdict = explainLoginField(field);
+  opLog("offer.start", "debug", { field: fieldInfo(field), verdict: verdict.reason, generator: hasGenerator, seq }, { trace });
 
   let res;
   try {
-    res = await chrome.runtime.sendMessage({ type: "inlineLogins" });
-  } catch {
+    res = await chrome.runtime.sendMessage({ type: "inlineLogins", trace });
+  } catch (e) {
     res = null;
+    opLog("offer.send.failed", "warn", { err: String(e?.message ?? e) }, { trace });
   }
-  if (seq !== offerSeq || field !== deepActiveElement()) return;
+  if (seq !== offerSeq || field !== deepActiveElement()) {
+    opLog("offer.dropped", "debug", { why: seq !== offerSeq ? "newer offer started" : "field lost focus", seq, now: offerSeq }, { trace });
+    return;
+  }
 
   const locked = !!(res?.ok && res.locked);
   const logins = res?.ok && !locked ? res.logins || [] : [];
+  opLog("offer.fetched", "debug", {
+    ok: res?.ok,
+    locked,
+    logins: logins.length,
+    generator: hasGenerator,
+    error: res?.error,
+    willShow: !!(locked || logins.length || hasGenerator),
+  }, { trace });
   if (!locked && !logins.length && !hasGenerator) return;
 
   const box = buildSuggestionBox(field);
@@ -768,12 +960,14 @@ async function buildOfferSuggestion(field) {
     box.appendChild(row);
     if (hasGenerator) appendGeneratorOptions(box, field, true);
     positionBox();
+    opLog("offer.shown", "debug", { mode: "locked", rows: box.children.length }, { trace });
     return;
   }
 
   if (logins.length) appendLoginRows(box, field, logins);
   if (hasGenerator) appendGeneratorOptions(box, field, logins.length > 0);
   positionBox(); // final height known now
+  opLog("offer.shown", "debug", { mode: "logins", logins: logins.length, rows: box.children.length }, { trace });
 }
 
 // codes are always an offer behind a click, never filled because a field appeared, a code is a bearer credential
@@ -796,6 +990,14 @@ function fillOtp(field, code) {
   const chars = code.replace(/[^A-Za-z0-9]/g, "").split("");
   const boxes = otpBoxGroup(field);
   otpFilling = true;
+  opLog("otp.fill.run", "info", {
+    // never the digits: total length and how the widget is built is enough to debug
+    codeLen: chars.length,
+    mode: boxes ? "group" : "single-field",
+    boxes: boxes ? boxes.length : 0,
+    start: boxes ? Math.max(0, boxes.indexOf(field)) : 0,
+    field: fieldInfo(field),
+  });
   try {
     if (!boxes) {
       field.focus();
@@ -803,16 +1005,19 @@ function fillOtp(field, code) {
       return;
     }
     const start = Math.max(0, boxes.indexOf(field));
+    let written = 0;
     chars.forEach((c, i) => {
       const box = boxes[start + i];
       if (!box) return;
       box.focus();
       setValue(box, c);
+      written += 1;
       // some widgets advance focus on keyup rather than on input
       box.dispatchEvent(new KeyboardEvent("keydown", { key: c, bubbles: true }));
       box.dispatchEvent(new KeyboardEvent("keyup", { key: c, bubbles: true }));
     });
     boxes[Math.min(start + chars.length - 1, boxes.length - 1)]?.focus();
+    if (written < chars.length) opLog("otp.fill.short", "warn", { written, wanted: chars.length, boxes: boxes.length, start });
   } finally {
     // release after the focus events settle
     setTimeout(() => { otpFilling = false; }, 0);
@@ -889,32 +1094,75 @@ function appendOneTimeCodeRows(box, field, rows) {
     }
     row.appendChild(text);
     registerRow(row, () => {
+      const trace = newTrace("otp-pick");
+      opTrace = trace;
+      opLog("pick.otp", "info", { id: r.id, source: r.source, anchor: fieldInfo(field) }, { trace });
       removeSuggestion();
       otpAnchor = field;
-      chrome.runtime.sendMessage({ type: "inlineFillOneTimeCode", id: r.id }).catch(() => {});
+      chrome.runtime
+        .sendMessage({ type: "inlineFillOneTimeCode", id: r.id, trace })
+        .then((res) => {
+          opLog(
+            res && res.ok === false ? "pick.otp.failed" : res && res.filled ? "pick.otp.filled" : "pick.otp.empty",
+            res && res.filled ? "info" : "warn",
+            { res: res ? { ok: res.ok, filled: res.filled, error: res.error } : "(no response)" },
+            { trace },
+          );
+        })
+        .catch((e) => opLog("pick.otp.failed", "error", { err: String(e?.message ?? e) }, { trace }));
     });
     box.appendChild(row);
   }
 }
 
 async function buildOneTimeCodeSuggestion(field) {
-  if (otpFilling) return;
-  const seq = ++offerSeq;
-  let res;
-  try {
-    res = await chrome.runtime.sendMessage({ type: "inlineOneTimeCodes" });
-  } catch {
+  if (otpFilling) {
+    opLog("otp.offer.skip", "debug", { why: "otpFilling (our own focus moves)" });
     return;
   }
-  if (seq !== offerSeq) return;
+  const trace = newTrace("otp");
+  opTrace = trace;
+  const seq = ++offerSeq;
+  const group = otpBoxGroup(field);
+  let res;
+  try {
+    res = await chrome.runtime.sendMessage({ type: "inlineOneTimeCodes", trace });
+  } catch (e) {
+    opLog("otp.offer.send.failed", "warn", { err: String(e?.message ?? e) }, { trace });
+    return;
+  }
+  if (seq !== offerSeq) {
+    opLog("otp.offer.dropped", "debug", { why: "newer offer started", seq, now: offerSeq }, { trace });
+    return;
+  }
   // a split widget moves focus between its boxes during the lookup (react can swap the node), accept any box in the group
   const active = deepActiveElement();
-  const group = otpBoxGroup(field);
-  if (!field.isConnected || !(active === field || (group && group.includes(active)))) return;
+  if (!field.isConnected || !(active === field || (group && group.includes(active)))) {
+    opLog("otp.offer.dropped", "debug", {
+      why: "field gone or focus moved",
+      connected: field.isConnected,
+      activeSame: active === field,
+      inGroup: !!(group && group.includes(active)),
+      boxCount: group ? group.length : 0,
+    }, { trace });
+    return;
+  }
   if (active !== field && active instanceof HTMLInputElement) field = active;
-  if (!res?.ok) return;
+  if (!res?.ok) {
+    opLog("otp.offer.failed", "warn", { error: res?.error, ok: res?.ok }, { trace });
+    return;
+  }
   const locked = !!res.locked;
   const rows = res.rows || [];
+  opLog("otp.offer.fetched", "debug", {
+    locked,
+    supported: res.supported,
+    rows: rows.length,
+    requiresAuth: res.requiresAuth,
+    error: res.error,
+    boxCount: group ? group.length : 0,
+    willShow: !(locked && res.supported === false) && !(!locked && !rows.length),
+  }, { trace });
   // a locked vault is worth a row only if this helper can offer codes at all
   if (!locked && !rows.length) return;
   if (locked && res.supported === false) return;
@@ -931,6 +1179,7 @@ async function buildOneTimeCodeSuggestion(field) {
   }
   appendOneTimeCodeRows(box, field, rows);
   positionBox();
+  opLog("otp.offer.shown", "debug", { rows: rows.length }, { trace });
 }
 
 // no image or QR scanning here, on purpose
@@ -1014,13 +1263,25 @@ async function onFocusIn(e) {
   // focusin from inside a shadow root retargets to the host, composedPath has the real input
   const field = (e.composedPath ? e.composedPath()[0] : null) || e.target;
   if (field instanceof HTMLInputElement && field.type === "password") everPassword.add(field);
-  if (field instanceof HTMLInputElement && isOtpField(field) && isVisible(field)) {
+  if (!(field instanceof HTMLInputElement)) {
+    opLog("focus.skip", "debug", { why: "not an input", tag: String(field?.tagName || "?").toLowerCase() });
+    return;
+  }
+  const otp = isOtpField(field);
+  const visible = isVisible(field);
+  const verdict = otp && visible ? { ok: true, reason: "otp_field" } : explainLoginField(field);
+  opLog("focus", "debug", {
+    field: fieldInfo(field),
+    otpField: otp,
+    verdict: verdict.reason,
+    willOffer: otp ? visible && frameIsSafe() : verdict.ok && frameIsSafe(),
+    frameSafe: frameIsSafe(),
+  });
+  if (otp && visible) {
     if (frameIsSafe()) buildOneTimeCodeSuggestion(field);
     return;
   }
-  if (!(field instanceof HTMLInputElement) || !isLoginField(field)) {
-    return;
-  }
+  if (!verdict.ok) return;
   if (!frameIsSafe()) return;
   // still offer on a pre-filled field (apple/chrome do), only stay quiet if we just filled it
   const v = (field.value || "").trim();
@@ -1031,6 +1292,7 @@ async function onFocusIn(e) {
       Date.now() - lastAutofill.at < 8000 &&
       (v === (lastAutofill.username || "") || v === (lastAutofill.password || ""));
     if (justOurs) {
+      opLog("focus.skip", "debug", { why: "prefilled by us just now" });
       removeSuggestion();
       return;
     }
@@ -1152,10 +1414,21 @@ function anchorPwField(root) {
 }
 
 // awaiting the lookup here lost the save on a redirect
-async function maybeOfferSave(scope) {
-  if (!frameIsSafe()) return;
+async function maybeOfferSave(scope, source) {
+  if (!frameIsSafe()) {
+    opLog("save.skip", "debug", { why: "frame unsafe", source });
+    return;
+  }
   const cred = collectSubmittedCredentials(scope);
-  if (!cred || !cred.password) return;
+  if (!cred || !cred.password) {
+    opLog("save.skip", "debug", {
+      why: "no submitted password value",
+      source,
+      found: !!cred,
+      pwFields: cred ? (cred.allPasswords || []).length : 0,
+    });
+    return;
+  }
 
   const genPw =
     lastGenerated && Date.now() - lastGenerated.at < 600000 ? lastGenerated.password : null;
@@ -1170,14 +1443,17 @@ async function maybeOfferSave(scope) {
     lastAutofill.password === cred.password &&
     Date.now() - lastAutofill.at < 300000
   ) {
-    console.debug("[Open Passwords] save skipped: recently autofilled");
+    opLog("save.skip", "debug", { why: "recently autofilled unchanged", source });
     return;
   }
 
   // 15s covers the click+submit+Enter burst ("shows up twice" fix)
   const key = `${location.hostname} ${cred.username || savePassword}`;
   const now = Date.now();
-  if (key === lastSaveKey && now - lastSaveAt < 15000) return;
+  if (key === lastSaveKey && now - lastSaveAt < 15000) {
+    opLog("save.skip", "debug", { why: "duplicate within 15s", source });
+    return;
+  }
   lastSaveKey = key;
   lastSaveAt = now;
 
@@ -1188,13 +1464,21 @@ async function maybeOfferSave(scope) {
     (cred.allPasswords || []).length >= 2 ||
     pwInputs.some((p) => (p.getAttribute("autocomplete") || "").toLowerCase().includes("new-password"));
 
-  // fire and forget, awaiting would let a navigating submit kill us
-  console.debug("[Open Passwords] handing save to background", {
-    host: location.hostname,
-    user: cred.username || "(none)",
+  const trace = newTrace("save");
+  opTrace = trace;
+  // user is masked and the password never leaves as a value, only as a length
+  opLog("save.offer", "info", {
+    source,
+    userMasked: opMask(cred.username) || "(none)",
+    userLen: (cred.username || "").length,
+    pwFields: (cred.allPasswords || []).length,
+    pwLen: String(savePassword || "").length,
     generated,
     newPwCtx,
-  });
+    hasGeneratedInForm: generated,
+  }, { trace });
+
+  // fire and forget, awaiting would let a navigating submit kill us
   chrome.runtime
     .sendMessage({
       type: "resolveSave",
@@ -1202,16 +1486,28 @@ async function maybeOfferSave(scope) {
       password: savePassword,
       generated,
       newPwCtx,
+      trace,
     })
-    .catch(() => {});
+    .then((r) =>
+      opLog(
+        r?.ok ? (r.saved ? "save.done" : "save.not-taken") : "save.failed",
+        r?.ok && r.saved ? "info" : r?.ok ? "debug" : "warn",
+        { ok: r?.ok, saved: r?.saved, skipped: r?.skipped, locked: r?.locked, error: r?.error, state: r?.state },
+        { trace },
+      ),
+    )
+    .catch((e) => opLog("save.send.failed", "error", { err: String(e?.message ?? e) }, { trace }));
 }
 
 document.addEventListener(
   "submit",
   (e) => {
-    if (!e.isTrusted) return;
+    if (!e.isTrusted) {
+      opLog("save.trigger", "debug", { source: "submit", ignored: "not trusted (programmatic submit)" });
+      return;
+    }
     removeSuggestion();
-    maybeOfferSave(e.target);
+    maybeOfferSave(e.target, "submit");
   },
   true,
 );
@@ -1220,7 +1516,7 @@ document.addEventListener(
   (e) => {
     if (!e.isTrusted || !(e.target instanceof Element)) return;
     const ctrl = e.target.closest('button, input[type=submit], input[type=button], [role="button"], a');
-    if (isSubmitControl(ctrl)) maybeOfferSave(ctrl.form || document);
+    if (isSubmitControl(ctrl)) maybeOfferSave(ctrl.form || document, "click");
   },
   true,
 );
@@ -1231,8 +1527,23 @@ document.addEventListener(
     const t = e.target;
     if (t instanceof HTMLInputElement && (isPasswordField(t) || isUsernameField(t))) {
       removeSuggestion(); // formless submit, Enter doesnt fire a submit event
-      maybeOfferSave(t.form || document);
+      maybeOfferSave(t.form || document, "enter");
     }
   },
   true,
 );
+
+// one boot line per frame: which build runs, and in which shape of frame
+opLog("content.boot", "info", {
+  build: OP_BUILD,
+  top: window === window.top,
+  srcdoc: location.href === "about:blank" || location.href === "about:srcdoc",
+  host: (() => {
+    try {
+      return location.hostname;
+    } catch (_) {
+      return "?";
+    }
+  })(),
+  frameSafe: frameIsSafe(),
+});

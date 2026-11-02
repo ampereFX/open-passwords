@@ -1,6 +1,7 @@
 #!/usr/bin/python3
 # reads the 6-digit code off Apple's helper window through System Events, nothing else on screen. needs Accessibility + Automation once
 import json
+import os
 import re
 import struct
 import subprocess
@@ -8,6 +9,27 @@ import sys
 import time
 
 HELPER = "PasswordManagerBrowserExtensionHelper"
+
+# File log next to the app's other diagnostics. stdout is the native-messaging channel
+# and must never carry anything but framed replies. The pairing code itself is never
+# logged, only whether one was found and how long it was.
+LOG_DIR = os.path.expanduser("~/Library/Logs/OpenPasswords")
+LOG_FILE = os.path.join(LOG_DIR, "autopair.log")
+LOG_MAX = 256 * 1024
+
+
+def log(msg):
+    try:
+        os.makedirs(LOG_DIR, exist_ok=True)
+        try:
+            if os.path.getsize(LOG_FILE) > LOG_MAX:
+                os.replace(LOG_FILE, LOG_FILE + ".1")
+        except OSError:
+            pass
+        with open(LOG_FILE, "a", encoding="utf-8") as f:
+            f.write(f"{time.strftime('%Y-%m-%dT%H:%M:%S')} pid={os.getpid()} {msg}\n")
+    except Exception:  # noqa: BLE001
+        pass
 
 # the digits may sit in one label ("123456") or one label per digit, so both shapes are collected
 DUMP = f'''
@@ -46,9 +68,13 @@ CHECK = 'tell application "System Events" to return count of processes'
 
 
 def osascript(script, timeout=10):
+    started = time.monotonic()
     r = subprocess.run(["/usr/bin/osascript", "-e", script], capture_output=True, text=True, timeout=timeout)
+    dur = int((time.monotonic() - started) * 1000)
     if r.returncode != 0:
+        log(f"osascript failed rc={r.returncode} dur={dur}ms err={((r.stderr or r.stdout).strip())[:200]!r}")
         raise RuntimeError((r.stderr or r.stdout).strip() or f"osascript exit {r.returncode}")
+    log(f"osascript ok dur={dur}ms outLines={len((r.stdout or '').splitlines())}")
     return r.stdout
 
 
@@ -84,12 +110,20 @@ def permission_hint(err):
 
 
 def read_code(timeout_ms):
-    deadline = time.monotonic() + max(500, min(int(timeout_ms), 20000)) / 1000.0
+    budget = max(500, min(int(timeout_ms), 20000))
+    deadline = time.monotonic() + budget / 1000.0
     last_err = None
+    attempts = 0
+    started = time.monotonic()
+    log(f"read start budget={budget}ms helper={HELPER}")
     while time.monotonic() < deadline:
+        attempts += 1
         try:
             code = extract_code(osascript(DUMP))
             if code:
+                dur = int((time.monotonic() - started) * 1000)
+                # length only: the code is the shared secret
+                log(f"read ok attempts={attempts} dur={dur}ms codeLen={len(code)}")
                 return {"ok": True, "code": code}
         except subprocess.TimeoutExpired:
             last_err = "System Events did not answer"
@@ -97,8 +131,11 @@ def read_code(timeout_ms):
             last_err = permission_hint(e)
             # a permission error will not clear by polling
             if last_err != str(e):
+                log(f"read denied attempts={attempts} err={last_err!r}")
                 return {"ok": False, "error": last_err}
         time.sleep(0.15)
+    dur = int((time.monotonic() - started) * 1000)
+    log(f"read timeout attempts={attempts} dur={dur}ms last={last_err!r}")
     return {"ok": False, "error": last_err or "no pairing window with a 6-digit code was visible"}
 
 
@@ -120,21 +157,27 @@ def main():
     if len(sys.argv) > 1 and sys.argv[1] == "--read":
         print(json.dumps(read_code(int(sys.argv[2]) if len(sys.argv) > 2 else 4000)))
         return
+    # a bare invocation (no framed request) still leaves a trace of who started us
+    log(f"started argv={sys.argv[1:2] if len(sys.argv) > 1 else []}")
     raw = sys.stdin.buffer.read(4)
     if len(raw) < 4:
         sys.exit(0)
     (n,) = struct.unpack("<I", raw)
     req = json.loads(sys.stdin.buffer.read(n))
     action = req.get("action")
+    log(f"request action={action!r}")
     if action == "check":
         try:
             osascript(CHECK, timeout=8)
             send({"ok": True})
         except Exception as e:  # noqa: BLE001
+            log(f"check failed err={permission_hint(e)!r}")
             send({"ok": False, "error": permission_hint(e)})
     elif action == "read":
-        send(read_code(req.get("timeoutMs", 6000)))
+        res = read_code(req.get("timeoutMs", 6000))
+        send(res)
     else:
+        log("unknown action")
         send({"ok": False, "error": "unknown action"})
 
 

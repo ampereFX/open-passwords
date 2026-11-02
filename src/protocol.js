@@ -11,6 +11,7 @@ import {
   QueryStatus,
   queryStatusError,
 } from "./crypto.js";
+import { errInfo, safeUrl, maskUser } from "./log.js";
 
 const NATIVE_HOST = "com.apple.passwordmanager";
 const BROWSER_NAME = "Chrome";
@@ -53,6 +54,16 @@ const QueryId = {
   [17]: "CmdDidFillOneTimeCode",
 };
 
+function cmdName(cmd) {
+  for (const [name, value] of Object.entries(Command)) if (value === cmd) return name;
+  return `cmd${cmd}`;
+}
+
+function hostParam(hostname) {
+  // already a bare hostname, safeUrl only normalizes it
+  return hostname ? safeUrl(`https://${hostname}/`).split("/")[0] : undefined;
+}
+
 const Action = { UPDATE: 1, SEARCH: 2, ADD_NEW: 3, MAYBE_ADD: 4, GHOST_SEARCH: 5 };
 
 export const State = {
@@ -79,11 +90,15 @@ function normalizeOtpEntries(entries) {
 }
 
 export class ApplePasswords {
-  constructor() {
+  constructor({ log } = {}) {
     this.port = undefined;
     this.session = undefined;
     this.capabilities = undefined;
     this.state = State.Disconnected;
+    this.stateReason = undefined;
+    // set by the background so every native call carries the user action that caused it
+    this.trace = undefined;
+    this._log = typeof log === "function" ? log : () => {};
     this._waiters = new Map();
     this._onState = () => {};
     this._onOneTimeCode = () => {};
@@ -101,6 +116,12 @@ export class ApplePasswords {
       () => {},
     );
     return run;
+  }
+
+  _logEvent(t, lvl, d) {
+    try {
+      this._log({ t, lvl, d: { ...d, trace: this.trace } });
+    } catch (_) {}
   }
 
   onStateChange(fn) {
@@ -125,9 +146,21 @@ export class ApplePasswords {
     return this.capabilities?.canSaveAccountWithEmptyUserName === true;
   }
 
-  _setState(s) {
-    if (this.state === s) return;
+  _setState(s, why) {
+    const from = this.state;
+    if (from === s) {
+      if (why) this._logEvent("state", "debug", { from, to: s, why, unchanged: true });
+      return;
+    }
     this.state = s;
+    this.stateReason = why || undefined;
+    this._logEvent("state", s === State.NoHelper || s === State.Disconnected ? "warn" : "info", {
+      from,
+      to: s,
+      why,
+      connected: this.port !== undefined,
+      hasSession: this.session !== undefined,
+    });
     try {
       this._onState(s);
     } catch (_) {}
@@ -144,15 +177,33 @@ export class ApplePasswords {
 
   _send(cmd, body = {}, timeoutMs = 5000) {
     if (!this.port) throw new Error("connection closed");
+    const name = cmdName(cmd);
     // a second request on the same cmd would steal the first one's reply
-    if (this._waiters.has(cmd)) return Promise.reject(new Error("another request is already in flight"));
+    if (this._waiters.has(cmd)) {
+      this._logEvent("native.reject", "warn", { cmd: name, why: "another request is already in flight" });
+      return Promise.reject(new Error("another request is already in flight"));
+    }
+    const started = Date.now();
+    const meta = { tab: body.tabId, frame: body.frameId, host: hostParam(body.url) };
+    this._logEvent("native.start", "debug", { cmd: name, timeout: timeoutMs == null ? "none" : timeoutMs, ...meta });
     return new Promise((resolve, reject) => {
-      const entry = { resolve, reject, timer: null };
+      const entry = {
+        resolve: (message) => {
+          this._logEvent("native.done", "debug", { cmd: name, dur: Date.now() - started, outcome: "reply", ...meta });
+          resolve(message);
+        },
+        reject: (e) => {
+          this._logEvent("native.done", "warn", { cmd: name, dur: Date.now() - started, outcome: "error", err: errInfo(e), ...meta });
+          reject(e);
+        },
+        timer: null,
+      };
       entry.timer =
         timeoutMs == null
           ? null
           : setTimeout(() => {
               if (this._waiters.get(cmd) === entry) this._waiters.delete(cmd);
+              this._logEvent("native.done", "warn", { cmd: name, dur: Date.now() - started, outcome: "timeout", ...meta });
               reject(new Error("timeout waiting for response"));
             }, timeoutMs);
       this._waiters.set(cmd, entry);
@@ -161,6 +212,7 @@ export class ApplePasswords {
       } catch (e) {
         if (entry.timer) clearTimeout(entry.timer);
         if (this._waiters.get(cmd) === entry) this._waiters.delete(cmd);
+        this._logEvent("native.done", "error", { cmd: name, dur: Date.now() - started, outcome: "post-failed", err: errInfo(e), ...meta });
         reject(e);
       }
     });
@@ -172,10 +224,23 @@ export class ApplePasswords {
       this._waiters.delete(message.cmd);
       if (w.timer) clearTimeout(w.timer);
       w.resolve(message);
+    } else if (
+      message.cmd === Command.ONE_TIME_CODE_AVAILABLE ||
+      message.cmd === Command.PASSWORDS_DISABLED ||
+      message.cmd === Command.RELOGIN_NEEDED
+    ) {
+      // these arrive without a request, so having no waiter is normal
+      this._logEvent("native.unsolicited", "debug", { cmd: cmdName(message.cmd) });
+    } else {
+      // a reply nobody waits for: the waiter timed out first, which is exactly the
+      // kind of desync that later looks like "the helper never answers"
+      this._logEvent("native.late-reply", "warn", { cmd: cmdName(message.cmd), why: "no waiter (arrived after timeout?)" });
     }
     if (message.cmd === Command.PASSWORDS_DISABLED || message.cmd === Command.RELOGIN_NEEDED) {
+      this._logEvent("native.session-lost", "warn", { cmd: cmdName(message.cmd) });
       this.session = undefined;
-      this._setState(State.NeedsPin);
+      // the port stays open, so a plain reconnect has to re-issue a handshake
+      this._setState(State.NeedsPin, `helper sent ${cmdName(message.cmd)}`);
     }
     if (message.cmd === Command.ONE_TIME_CODE_AVAILABLE && !w) {
       try {
@@ -186,13 +251,18 @@ export class ApplePasswords {
 
   // never resets an unlocked session, apple's extension re-pairs on every connect
   async connect() {
-    if (this.port) return;
+    if (this.port) {
+      this._logEvent("connect", "debug", { skipped: "port already open", state: this.state });
+      return;
+    }
+    this._logEvent("connect", "info", { host: NATIVE_HOST });
     return new Promise((resolve, reject) => {
       let port;
       try {
         port = chrome.runtime.connectNative(NATIVE_HOST);
       } catch (e) {
-        this._setState(State.NoHelper);
+        this._logEvent("connect.failed", "error", { err: errInfo(e), stage: "connectNative" });
+        this._setState(State.NoHelper, "connectNative threw");
         return reject(e);
       }
       this.port = port;
@@ -200,27 +270,46 @@ export class ApplePasswords {
       port.onMessage.addListener((msg) => this._dispatch(msg));
       port.onDisconnect.addListener(() => {
         const err = chrome.runtime.lastError?.message;
+        this._logEvent("disconnect", "warn", { lastError: err ? String(err) : "(none)" });
         this.port = undefined;
         this.session = undefined;
-        if (err && /not found|forbidden|host/i.test(err)) this._setState(State.NoHelper);
-        else this._setState(State.Disconnected);
+        this._waiters.clear();
+        if (err && /not found|forbidden|host/i.test(err)) this._setState(State.NoHelper, `native host error: ${err}`);
+        else this._setState(State.Disconnected, "port disconnected");
       });
 
       this._send(Command.GET_CAPABILITIES)
         .then((reply) => {
           this.capabilities = reply.capabilities ?? {};
+          this._logEvent("capabilities", "info", {
+            keys: Object.keys(this.capabilities),
+            secretSessionVersion: this.capabilities.secretSessionVersion,
+            shouldUseBase64: this.capabilities.shouldUseBase64,
+            canFillOneTimeCodes: this.capabilities.canFillOneTimeCodes,
+            scanForOTPURI: this.capabilities.scanForOTPURI,
+            canOpenPasswordsAppToNewPasswordSheet: this.capabilities.canOpenPasswordsAppToNewPasswordSheet,
+          });
           // helper negotiates the version per handshake via PROTO, so only reject an explicit non-RFC demand
           if (
             this.capabilities.secretSessionVersion !== undefined &&
             this.capabilities.secretSessionVersion !== SecretSessionVersion.SRPWithRFCVerification
           ) {
+            this._logEvent("connect.failed", "error", {
+              stage: "capabilities",
+              secretSessionVersion: this.capabilities.secretSessionVersion,
+              expected: SecretSessionVersion.SRPWithRFCVerification,
+              note: "port stays open, retry then early-returns",
+            });
             return reject(new Error("unsupported capabilities (expected SRP RFC verification)"));
           }
           this.session = new SRPSession(this.capabilities.shouldUseBase64);
-          this._setState(State.NeedsPin);
+          this._setState(State.NeedsPin, "capabilities received");
           resolve();
         })
-        .catch(reject);
+        .catch((e) => {
+          this._logEvent("connect.failed", "error", { stage: "capabilities", err: errInfo(e) });
+          reject(e);
+        });
     });
   }
 
@@ -255,6 +344,7 @@ export class ApplePasswords {
     this.session.salt = undefined;
     this.session.sharedKey = undefined;
     this._challengeGen++;
+    this._logEvent("challenge.request", "info", { gen: this._challengeGen });
 
     const reply = await this._send(Command.HANDSHAKE, {
       msg: {
@@ -280,7 +370,8 @@ export class ApplePasswords {
     const s = this.session.deserialize(pake.s);
     this.session.setServerPublicKey(B, s);
     this._challengeAt = Date.now();
-    this._setState(State.NeedsPin);
+    this._logEvent("challenge.issued", "info", { gen: this._challengeGen, proto: pake.PROTO });
+    this._setState(State.NeedsPin, "challenge issued");
     return true;
   }
 
@@ -288,13 +379,17 @@ export class ApplePasswords {
   async verifyPin(pin) {
     if (!this.session) throw new Error("not connected");
     if (!this.hasChallenge) {
+      this._logEvent("verify", "warn", { why: "no live challenge", pinLen: String(pin || "").length });
       await this.requestChallenge();
       throw challengeError("Enter the new code your Mac is showing now");
     }
     const gen = this._challengeGen;
+    this._logEvent("verify", "info", { gen, pinLen: String(pin || "").length });
     return this._withLock(async () => {
       // re-issued while queued, typed code is for the old prompt
       if (gen !== this._challengeGen) throw challengeError("Enter the new code your Mac is showing now");
+      // declared outside the try so the catch can report the helper's ErrCode
+      let pake;
       try {
         await this.session.setSharedKey(pin);
         const m = await this.session.computeM();
@@ -310,7 +405,7 @@ export class ApplePasswords {
           },
         });
 
-        const pake = JSON.parse(bytesToUtf8(base64ToBytes(reply.payload.PAKE)));
+        pake = JSON.parse(bytesToUtf8(base64ToBytes(reply.payload.PAKE)));
         if (pake.TID !== this.session.username) throw new Error("verification for another session");
         if (pake.MSG.toString() !== MSGType.ServerVerification.toString()) throw new Error("unexpected server message");
         if (pake.ErrCode === 1) throw new Error("Incorrect code");
@@ -320,8 +415,10 @@ export class ApplePasswords {
         if (!constantTimeEqual(this.session.deserialize(pake.HAMK), hamk))
           throw new Error("server HAMK mismatch");
 
-        this._setState(State.Unlocked);
+        this._logEvent("verify.ok", "info", { gen });
+        this._setState(State.Unlocked, "PIN verified");
       } catch (e) {
+        this._logEvent("verify.failed", "warn", { gen, err: errInfo(e), errCode: pake?.ErrCode });
         // helper burns the challenge on a failed verify, drop it so the next attempt gets a fresh prompt
         if (this.session) {
           this.session.sharedKey = undefined;
@@ -352,6 +449,15 @@ export class ApplePasswords {
     return JSON.parse(bytesToUtf8(data));
   }
 
+  _logQuery(cmd, hostname, res, extra) {
+    this._logEvent("query", res.STATUS === QueryStatus.Success ? "debug" : "warn", {
+      cmd: QueryId[cmd] || cmdName(cmd),
+      host: hostParam(hostname),
+      status: res.STATUS,
+      ...extra,
+    });
+  }
+
   async getLoginNamesForURL(tabId, url) {
     if (!this.ready) throw new Error("not unlocked");
     const { hostname } = new URL(url);
@@ -363,6 +469,7 @@ export class ApplePasswords {
         { ACT: Action.GHOST_SEARCH, URL: hostname },
         5000,
       );
+      this._logQuery(Command.GET_LOGIN_NAMES_FOR_URL, hostname, res, { n: (res.Entries ?? []).length });
       if (res.STATUS === QueryStatus.Success)
         return (res.Entries ?? []).map((e) => ({ username: e.USR, sites: e.sites }));
       if (res.STATUS === QueryStatus.NoResults) return [];
@@ -384,10 +491,18 @@ export class ApplePasswords {
       );
       if (res.STATUS === QueryStatus.Success) {
         const e = (res.Entries ?? [])[0];
+        // never the value, only its length and the account it belongs to
+        this._logQuery(Command.GET_PASSWORD_FOR_LOGIN_NAME, hostname, res, {
+          n: (res.Entries ?? []).length,
+          requested: maskUser(loginName.username),
+          got: e ? maskUser(e.USR) : "(none)",
+          pwLen: e?.PWD ? String(e.PWD).length : 0,
+        });
         if (!e) return undefined;
         // reply is USR/PWD/customTitle/highLevelDomain/sites, no note or OTP seed
         return { username: e.USR, password: e.PWD, sites: e.sites };
       }
+      this._logQuery(Command.GET_PASSWORD_FOR_LOGIN_NAME, hostname, res, { requested: maskUser(loginName.username) });
       if (res.STATUS === QueryStatus.NoResults) return undefined;
       throw queryStatusError(res.STATUS);
     });
@@ -418,10 +533,13 @@ export class ApplePasswords {
           SMSG: JSON.stringify({ TID: this.session.username, SDATA: sdata }),
         },
       };
+      this._logEvent("save.request", "info", { host: hostParam(hostname), user: maskUser(username), pwLen: String(password).length });
       // ack is empty and confirmation happens in the native prompt, so a slow ack is not an error
       try {
         await this._send(Command.SET_PASSWORD_FOR_LOGIN_NAME_URL, body, 3000);
+        this._logEvent("save.acked", "info", { host: hostParam(hostname), user: maskUser(username) });
       } catch (e) {
+        this._logEvent("save.ack", "warn", { err: errInfo(e), tolerated: /timeout/i.test(String(e?.message ?? "")) });
         if (!/timeout/i.test(String(e?.message ?? e))) throw e;
       }
       return true;
@@ -436,6 +554,15 @@ export class ApplePasswords {
     return this._withLock(async () => {
       const res = await this._encryptedQuery(Command.GET_ONE_TIME_CODES, tabId, null, body, 8000, frameId);
       const requiresAuth = !!res.RequiresUserAuthenticationToFill;
+      this._logEvent("query", res.STATUS === QueryStatus.Success ? "debug" : "warn", {
+        cmd: QueryId[Command.GET_ONE_TIME_CODES],
+        status: res.STATUS,
+        n: (res.Entries ?? []).length,
+        requiresAuth,
+        urls: (frameUrls || []).map((u) => safeUrl(u)),
+        tab: tabId,
+        frame: frameId,
+      });
       if (res.STATUS === QueryStatus.Success) return { entries: normalizeOtpEntries(res.Entries), requiresAuth };
       if (res.STATUS === QueryStatus.NoResults) return { entries: [], requiresAuth };
       throw queryStatusError(res.STATUS);
@@ -449,6 +576,14 @@ export class ApplePasswords {
     if (username) body.username = username;
     return this._withLock(async () => {
       const res = await this._encryptedQuery(Command.DID_FILL_ONE_TIME_CODE, tabId, null, body, null, frameId);
+      this._logEvent("query", res.STATUS === QueryStatus.Success ? "debug" : "warn", {
+        cmd: QueryId[Command.DID_FILL_ONE_TIME_CODE],
+        status: res.STATUS,
+        n: (res.Entries ?? []).length,
+        user: maskUser(username),
+        tab: tabId,
+        frame: frameId,
+      });
       if (res.STATUS === QueryStatus.Success) return normalizeOtpEntries(res.Entries);
       if (res.STATUS === QueryStatus.NoResults) return [];
       throw queryStatusError(res.STATUS);
@@ -458,6 +593,13 @@ export class ApplePasswords {
   launchPasswordsApp({ searchUrl, newPasswordUrl, totpUri, totpPageUrl } = {}) {
     if (!this.port) throw new Error("not connected");
     const msg = { cmd: Command.LAUNCH_PASSWORDS_APP };
+    // the otpauth URI carries the TOTP secret, only its shape goes into the log
+    this._logEvent("app.launch", "info", {
+      mode: totpUri ? "totp" : newPasswordUrl ? "new" : "search",
+      hasUri: !!totpUri,
+      uriScheme: totpUri ? String(totpUri).split(":")[0].slice(0, 20) : undefined,
+      target: searchUrl || newPasswordUrl ? safeUrl(searchUrl || newPasswordUrl) : undefined,
+    });
     if (totpUri) {
       if (!this.canSetUpTotp) throw new Error("this helper cant set up verification codes");
       msg.setUpTOTPURI = totpUri;
@@ -473,6 +615,7 @@ export class ApplePasswords {
 
   disconnect() {
     if (!this.port) return;
+    this._logEvent("disconnect", "info", { by: "user" });
     try {
       this.port.postMessage({ cmd: Command.END });
     } catch (_) {}
@@ -481,6 +624,6 @@ export class ApplePasswords {
     } catch (_) {}
     this.port = undefined;
     this.session = undefined;
-    this._setState(State.Disconnected);
+    this._setState(State.Disconnected, "user disconnected");
   }
 }

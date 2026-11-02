@@ -1,0 +1,11 @@
+{
+  "name": "open-passwords",
+  "version": "0.50.0",
+  "private": true,
+  "type": "module",
+  "description": "Open Passwords — Chrome client for Apple Passwords. This file exists for the JS self-tests only; the extension itself is loaded unpacked.",
+  "scripts": {
+    "test:log": "node scripts/log-selftest.mjs",
+    "test": "node scripts/log-selftest.mjs"
+  }
+}

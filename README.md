@@ -133,12 +133,40 @@ The extension asks for a code only when no live code exists. After a failed atte
 
 A code expires after 3 minutes. After that, the extension asks your Mac for a new code instead of checking the old one.
 
+## Diagnostics: what happened when a fill did nothing
+
+Every decision the extension makes is recorded in order, so a problem on one specific site can be read after the fact instead of guessed at. Open the popup, expand **Diagnostics**:
+
+- how many events and problems are buffered, the current state and *why* it is that state (`needs_pin (helper sent RELOGIN_NEEDED)`, `no_helper (native host error: …)`)
+- the last problem, in one line
+- **Copy** / **Export .json** for a report, **Clear** to wipe it, and **Record everything (verbose)** (on by default)
+
+Each event carries a timestamp, a level, an optional trace id that follows one user action from the content script through the worker down to the native command, and the tab/frame/host (plus an `incognito` flag, which is what differs in a private window).
+
+What is recorded:
+
+| Area | Examples |
+|---|---|
+| session | connect/disconnect with the helper's own error text, capabilities, challenge issued, PIN verified, every state change with a reason |
+| native | each command with duration, timeout, reply or the exact failure (`timeout`, `late-reply` with no waiter) |
+| detection | every focus on an input with the verdict that decided it (`autocomplete_username`, `search_or_combo`, `form_autocomplete_off`, `not_visible`, …) |
+| offer | why the dropdown was shown or not (`locked`, `0 logins`, `no generator`), what the page returned |
+| fill | candidate counts, the field that was actually chosen (shape only), origin checks, and the per-frame reply the background got back |
+| codes | list size, source (`totp`/Messages), `requiresAuth`, how many of a split widget's boxes were written |
+| save | why a save was skipped, which vault account it was pinned to, whether the helper acked |
+| helper | `policy.log` / `autopair.log` in `~/Library/Logs/OpenPasswords` (rotated at 256 KB) |
+
+What is never recorded, enforced in one place (`src/log.js`) rather than at the call sites: passwords (only lengths), the pairing code, TOTP values, SRP material (`A`, `B`, `salt`, `M`, `sharedKey`), `SDATA`/`PAYLOAD` blobs, and URL query strings or fragments. Usernames are masked (`j•••n@example.com`), hosts are kept because they are what you are debugging. `npm test` asserts this contract.
+
+The buffer lives in `chrome.storage.session`: it survives a service-worker restart (which happens every ~30 s) but never a browser restart, so it does not become a history file. Warnings and errors are additionally kept in `chrome.storage.local` (max 25) so a crash survives a restart.
+
 ## Security notes
 
 - the session key lives only in the worker's memory and is never written to disk
 - every password query is AES-GCM encrypted end to end with the helper
 - the PIN only derives the SRP shared key, it isn't stored
 - reading a password can trigger a Touch ID prompt, that prompt comes from the helper
+- the diagnostics export contains hostnames and the extension's decisions, never credentials; review it before sharing
 
 ## Credits
 

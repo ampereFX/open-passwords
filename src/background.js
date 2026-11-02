@@ -1,14 +1,59 @@
 // alarm keep-alive holds the MV3 worker so the PIN isnt re-prompted every idle-out
 
 import { ApplePasswords, State } from "./protocol.js";
+import { DiagLog, errInfo, maskUser, safeUrl, sanitize } from "./log.js";
 
-const client = new ApplePasswords();
+const VERSION = chrome.runtime.getManifest().version;
+/** true when this worker is the incognito instance (split mode), which explains most "works in one window" reports */
+const INCOGNITO = (() => {
+  try {
+    return chrome.extension?.inIncognitoContext === true;
+  } catch (_) {
+    return false;
+  }
+})();
+
+const diag = new DiagLog();
+
+// verbose is the default: a rare bug is worth more than a small buffer. Turning it off
+// keeps warnings/errors and drops the per-focus, per-native-call detail.
+let verboseDiag = true;
+try {
+  chrome.storage.local.get({ verboseDiagnostics: true }, (d) => {
+    verboseDiag = d?.verboseDiagnostics !== false;
+  });
+  chrome.storage.onChanged.addListener((changes, area) => {
+    if (area === "local" && changes.verboseDiagnostics) verboseDiag = changes.verboseDiagnostics.newValue !== false;
+  });
+} catch (_) {}
+
+function logUp(t, lvl, d, extra = {}) {
+  if (!verboseDiag && lvl === "debug") return;
+  try {
+    diag.push({ t, lvl, d, ...extra });
+  } catch (_) {}
+}
+
+const client = new ApplePasswords({
+  log: ({ t, lvl, d }) => {
+    const { trace, ...rest } = d || {};
+    diag.push({ t, lvl, d: rest, trace });
+  },
+});
 
 client.onStateChange((s) => {
   if (s !== State.Unlocked) {
     pwCacheClear();
     otpByTab.clear();
   }
+  logUp("state.broadcast", "info", {
+    state: s,
+    reason: client.stateReason,
+    incognito: INCOGNITO,
+    cachedPw: pwCacheSize(),
+    pendingSaves: pendingSaves.length,
+    lastFillTabs: lastFillByTab.size,
+  });
   broadcast({ type: "state", state: s });
 });
 
@@ -39,17 +84,20 @@ async function tryAutoPair(reason) {
   if (autoPairBusy || client.state !== State.NeedsPin) return false;
   if (!(await autoPairEnabled())) return false;
   autoPairBusy = true;
+  logUp("autopair.start", "info", { reason, hasChallenge: client.hasChallenge });
   try {
     // reuse a code already on screen rather than replacing it under the user
     await withTimeout(client.requestChallenge({ ifNeeded: true }), 8000, "challenge timed out");
     const res = await autoPairMsg({ action: "read", timeoutMs: 6000 });
     if (!res.ok || !res.code) {
       autoPairError = res.error || "no code visible";
-      console.debug("[Open Passwords] auto-pair skipped:", autoPairError, reason);
+      logUp("autopair.skipped", "warn", { reason, error: autoPairError, codeLen: 0 });
       return false;
     }
+    logUp("autopair.code", "debug", { codeLen: String(res.code).length });
     await withTimeout(client.verifyPin(res.code), 8000, "verification timed out");
     autoPairError = null;
+    logUp("autopair.ok", "info", { reason });
     if (client.ready) {
       flushPendingSaves();
       // only the active tab can have the inline PIN box open
@@ -61,7 +109,7 @@ async function tryAutoPair(reason) {
     return client.ready;
   } catch (e) {
     autoPairError = String(e?.message ?? e);
-    console.debug("[Open Passwords] auto-pair failed:", autoPairError, reason);
+    logUp("autopair.failed", "warn", { reason, err: errInfo(e) });
     return false;
   } finally {
     autoPairBusy = false;
@@ -71,10 +119,13 @@ async function tryAutoPair(reason) {
 client.onOneTimeCodeAvailable(async () => {
   try {
     const tab = await activeTab();
+    logUp("otp.available", "info", { tab: tab?.id, host: tab?.url ? safeUrl(tab.url) : undefined });
     if (tab?.id == null) return;
     otpByTab.delete(tab.id);
     chrome.tabs.sendMessage(tab.id, { type: "oneTimeCodeAvailable" }).catch(() => {});
-  } catch (_) {}
+  } catch (e) {
+    logUp("otp.available.failed", "warn", { err: errInfo(e) });
+  }
 });
 
 // rows resolve by id so the page never chooses the username/domain
@@ -98,26 +149,60 @@ function otpRow(e, i) {
 async function listOneTimeCodes(tabId, frameId, frameUrls) {
   const { entries, requiresAuth } = await client.getOneTimeCodes(tabId, frameId, frameUrls);
   otpByTab.set(tabId, { at: Date.now(), entries, frameId, frameUrls });
+  logUp("otp.list", "debug", {
+    tab: tabId,
+    frame: frameId,
+    n: entries.length,
+    requiresAuth,
+    sources: [...new Set(entries.map((e) => e.source))],
+    frames: (frameUrls || []).map((u) => safeUrl(u)),
+  });
   return { rows: entries.map(otpRow), requiresAuth };
 }
 
 // TOTP is re-read now, the value rotates and this read triggers Touch ID when the vault demands it
 async function resolveOneTimeCode(tabId, id) {
   const cached = otpByTab.get(tabId);
-  if (!cached || Date.now() - cached.at > OTP_LIST_TTL_MS) throw new Error("code list expired, focus the field again");
+  const age = cached ? Date.now() - cached.at : -1;
+  if (!cached || age > OTP_LIST_TTL_MS) {
+    logUp("otp.resolve.failed", "warn", { tab: tabId, id, why: cached ? "list expired" : "no list", age });
+    throw new Error("code list expired, focus the field again");
+  }
   const entry = cached.entries[id];
-  if (!entry) throw new Error("unknown code");
-  if (entry.source !== "totp") return entry.code;
+  if (!entry) {
+    logUp("otp.resolve.failed", "warn", { tab: tabId, id, why: "unknown id", listed: cached.entries.length });
+    throw new Error("unknown code");
+  }
+  if (entry.source !== "totp") {
+    logUp("otp.resolve", "debug", { tab: tabId, id, source: entry.source, codeLen: String(entry.code || "").length, age });
+    return entry.code;
+  }
   const fresh = await client.readOneTimeCode(tabId, cached.frameId, cached.frameUrls, entry.username);
   const match =
     fresh.find((e) => e.source === "totp" && e.username === entry.username && e.domain === entry.domain) ||
     fresh.find((e) => e.source === "totp");
-  if (!match?.code) throw new Error("no code returned");
+  if (!match?.code) {
+    logUp("otp.resolve.failed", "warn", { tab: tabId, id, why: "no totp in fresh read", n: fresh.length });
+    throw new Error("no code returned");
+  }
+  logUp("otp.resolve", "debug", {
+    tab: tabId,
+    id,
+    source: "totp",
+    exactMatch: !!(match.username === entry.username && match.domain === entry.domain),
+    codeLen: String(match.code).length,
+  });
   return match.code;
 }
 
 function broadcast(msg) {
-  chrome.runtime.sendMessage(msg).catch(() => {});
+  chrome.runtime.sendMessage(msg).catch((e) => {
+    // "no receiving end" is normal when no popup is open, anything else is not
+    const text = String(e?.message ?? e);
+    if (!/Receiving end does not exist|Could not establish connection/i.test(text)) {
+      logUp("broadcast.failed", "debug", { err: text });
+    }
+  });
 }
 
 const mruByHost = new Map();
@@ -224,6 +309,9 @@ function pwCacheSet(host, cred) {
 function pwCacheClear() {
   pwCache.clear();
 }
+function pwCacheSize() {
+  return pwCache.size;
+}
 
 function withTimeout(promise, ms, label) {
   return Promise.race([
@@ -243,16 +331,39 @@ chrome.alarms.onAlarm.addListener((a) => {
 
 async function ensureConnected() {
   if (client.state === State.Disconnected) {
+    logUp("connect.ensure", "debug", { state: client.state });
     try {
       await client.connect();
     } catch (e) {
       // surfaced via state change (NoHelper / Disconnected)
+      logUp("connect.ensure.failed", "warn", { err: errInfo(e), state: client.state, portOpen: client.port !== undefined });
     }
+  } else if (client.state !== State.Unlocked) {
+    // NoHelper / NeedsPin: a retry would early-return on the open port, worth recording
+    logUp("connect.ensure.skip", "debug", { state: client.state, portOpen: client.port !== undefined });
   }
 }
 
-chrome.runtime.onStartup.addListener(ensureConnected);
-chrome.runtime.onInstalled.addListener(ensureConnected);
+diag
+  .load({ ver: VERSION, incognito: INCOGNITO, ua: navigator.userAgent, scope: "service worker" })
+  .then(() => logUp("sw.boot", "info", { ver: VERSION, incognito: INCOGNITO, state: client.state, alarms: !!chrome.alarms }))
+  .catch(() => {});
+
+self.addEventListener("error", (e) => {
+  logUp("sw.error", "error", { err: errInfo(e?.error || e?.message || "unknown") });
+});
+self.addEventListener("unhandledrejection", (e) => {
+  logUp("sw.unhandled-rejection", "error", { err: errInfo(e?.reason) });
+});
+
+chrome.runtime.onStartup.addListener(() => {
+  logUp("sw.event", "info", { name: "onStartup" });
+  ensureConnected();
+});
+chrome.runtime.onInstalled.addListener((d) => {
+  logUp("sw.event", "info", { name: "onInstalled", reason: d?.reason, previous: d?.previousVersion });
+  ensureConnected();
+});
 ensureConnected();
 
 function suppressChromeAutofill() {
@@ -261,14 +372,26 @@ function suppressChromeAutofill() {
   // credit-card autofill is never touched, google pay keeps working
   chrome.storage?.local?.get({ suppressSaveBubble: true, suppressAddressAutofill: false }, (o) => {
     if (chrome.runtime.lastError) return;
+    logUp("pref.apply", "debug", {
+      suppressSaveBubble: !!o.suppressSaveBubble,
+      suppressAddressAutofill: !!o.suppressAddressAutofill,
+    });
     try {
       if (o.suppressSaveBubble) {
-        svc.passwordSavingEnabled.set({ value: false }, () => void chrome.runtime.lastError);
+        svc.passwordSavingEnabled.set({ value: false }, () => {
+          const err = chrome.runtime.lastError?.message;
+          logUp("pref.set", err ? "warn" : "debug", { which: "passwordSavingEnabled", value: false, err });
+        });
       }
       if (o.suppressAddressAutofill && svc.autofillAddressEnabled) {
-        svc.autofillAddressEnabled.set({ value: false }, () => void chrome.runtime.lastError);
+        svc.autofillAddressEnabled.set({ value: false }, () => {
+          const err = chrome.runtime.lastError?.message;
+          logUp("pref.set", err ? "warn" : "debug", { which: "autofillAddressEnabled", value: false, err });
+        });
       }
-    } catch (_) {}
+    } catch (e) {
+      logUp("pref.set.failed", "warn", { err: errInfo(e) });
+    }
   });
 }
 chrome.runtime.onInstalled.addListener(suppressChromeAutofill);
@@ -313,26 +436,108 @@ const CONTENT_ALLOWED = new Set([
   "requestChallenge",
   "verifyPin",
   "resolveSave",
+  "log",
 ]);
 
 chrome.commands?.onCommand.addListener(async (command) => {
+  logUp("shortcut", "info", { command });
   if (command !== "fill-login") return;
   const tab = await activeTab();
   if (tab?.id == null) return;
   chrome.tabs.sendMessage(tab.id, { type: "shortcut" }).catch(() => {});
 });
 
-chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
+// what the UI/popup is allowed to see about a response, without ever echoing a secret
+function summarizeResponse(res) {
+  if (res === undefined) return "(no response)";
+  if (res === null || typeof res !== "object") return sanitize(res);
+  const out = {};
+  for (const [k, v] of Object.entries(res)) {
+    if ((k === "logins" || k === "rows" || k === "entries") && Array.isArray(v)) {
+      out[k] = v.length;
+      const first = v.find((x) => x && typeof x === "object" && x.username);
+      if (first) out.firstUser = maskUser(first.username);
+    } else if (k === "code") {
+      out.code = v ? `[redacted len=${String(v).length}]` : v;
+    } else {
+      out[k] = v;
+    }
+  }
+  return sanitize(out);
+}
+
+// the one place where every message and every response is recorded
+chrome.runtime.onMessage.addListener((msg, sender, rawRespond) => {
+  const started = Date.now();
+  const fromUi = isFromOwnUi(sender);
+  const fromContent = sender.id === chrome.runtime.id && sender.tab !== undefined;
+  const trace = msg?.trace ? String(msg.trace).slice(0, 40) : undefined;
+  const ctx = {
+    tab: sender.tab?.id,
+    frame: sender.frameId,
+    top: sender.frameId === 0,
+    inc: sender.tab?.incognito === true ? true : undefined,
+    host: sender.url ? safeUrl(sender.url) : undefined,
+    route: fromUi ? "ui" : fromContent ? "content" : "other",
+  };
+  if (trace) client.trace = trace;
+  const isLog = msg?.type === "log";
+  if (!isLog) {
+    logUp(
+      "msg.in",
+      "debug",
+      { type: msg?.type, keys: msg && typeof msg === "object" ? Object.keys(msg) : [], state: client.state },
+      { trace, ctx },
+    );
+  }
+  // every response goes through here: nothing answers without leaving a trace
+  const sendResponse = (res) => {
+    if (!isLog) {
+      logUp(
+        "msg.out",
+        res?.ok === false ? "warn" : "debug",
+        {
+          type: msg?.type,
+          dur: Date.now() - started,
+          res: summarizeResponse(res),
+          state: client.state,
+          stateReason: client.stateReason,
+        },
+        { trace, ctx },
+      );
+    }
+    try {
+      rawRespond(res);
+    } catch (_) {}
+  };
   (async () => {
     try {
-      const fromUi = isFromOwnUi(sender);
-      const fromContent = sender.id === chrome.runtime.id && sender.tab !== undefined;
       if (!fromUi && !(fromContent && CONTENT_ALLOWED.has(msg?.type))) {
+        logUp("msg.forbidden", "warn", { type: msg?.type, route: ctx.route }, { trace, ctx });
         sendResponse({ ok: false, error: "forbidden" });
         return;
       }
 
       switch (msg?.type) {
+        case "log": {
+          // content scripts and the popup append through here, the buffer stays in the worker
+          const events = Array.isArray(msg.events) ? msg.events.slice(0, 40) : [];
+          let n = 0;
+          for (const ev of events) {
+            if (!ev || typeof ev !== "object") continue;
+            if (ev.lvl === "debug" && !verboseDiag) continue;
+            diag.push({
+              t: String(ev.t || "content").slice(0, 40),
+              lvl: ["debug", "info", "warn", "error"].includes(ev.lvl) ? ev.lvl : "debug",
+              d: ev.d,
+              trace: ev.trace || trace,
+              ctx: ev.ctx || ctx,
+            });
+            n++;
+          }
+          sendResponse({ ok: true, logged: n });
+          break;
+        }
         case "inlineLogins": {
           // keyed to sender.url not the top tab
           const frameUrl = sender.url;
@@ -341,12 +546,17 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
           if (!client.ready) return sendResponse({ ok: true, locked: true, logins: [] });
           try {
             const logins = await client.getLoginNamesForURL(sender.tab?.id, frameUrl);
-            sendResponse({
-              ok: true,
-              locked: false,
-              logins: uniqueByUsername(orderByMru(registrableHost(frameUrl), logins)),
-            });
-          } catch {
+            const ordered = uniqueByUsername(orderByMru(registrableHost(frameUrl), logins));
+            logUp(
+              "fill.logins",
+              "debug",
+              { raw: logins.length, uniq: ordered.length, users: ordered.slice(0, 6).map((l) => maskUser(l.username)) },
+              { trace, ctx },
+            );
+            sendResponse({ ok: true, locked: false, logins: ordered });
+          } catch (e) {
+            // this used to surface as "no saved passwords" with no hint that the query failed
+            logUp("fill.logins.failed", "warn", { err: errInfo(e), state: client.state }, { trace, ctx });
             sendResponse({ ok: true, locked: false, logins: [] });
           }
           break;
@@ -357,12 +567,17 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
           if (!frameUrl || sender.tab?.id == null) return sendResponse({ ok: false, error: "no frame" });
           await ensureConnected();
           // capabilities arrive with the hello, before the PIN, so locked still knows if codes are supported
-          if (!client.ready) return sendResponse({ ok: true, locked: true, supported: client.canFillOneTimeCodes, rows: [] });
-          if (!client.canFillOneTimeCodes) return sendResponse({ ok: true, locked: false, supported: false, rows: [] });
+          if (!client.ready)
+            return sendResponse({ ok: true, locked: true, supported: client.canFillOneTimeCodes, rows: [] });
+          if (!client.canFillOneTimeCodes) {
+            logUp("otp.unsupported", "debug", { caps: client.capabilities }, { trace, ctx });
+            return sendResponse({ ok: true, locked: false, supported: false, rows: [] });
+          }
           try {
             const { rows, requiresAuth } = await listOneTimeCodes(sender.tab.id, sender.frameId ?? 0, frameUrlsFor(sender));
             sendResponse({ ok: true, locked: false, supported: true, rows, requiresAuth });
           } catch (e) {
+            logUp("otp.list.failed", "warn", { err: errInfo(e) }, { trace, ctx });
             sendResponse({ ok: true, locked: false, supported: true, rows: [], error: String(e?.message ?? e) });
           }
           break;
@@ -377,11 +592,13 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
             return sendResponse({ ok: false, error: "refusing to fill on a non-HTTPS frame" });
           }
           const code = await resolveOneTimeCode(sender.tab.id, Number(msg.id));
+          logUp("otp.fill", "info", { id: msg.id, codeLen: String(code || "").length, expectedHost: host }, { trace, ctx });
           const resp = await chrome.tabs.sendMessage(
             sender.tab.id,
             { type: "fillOtp", code, expectedHost: host },
             { frameId },
           );
+          logUp("otp.fill.result", resp?.filled ? "info" : "warn", { filled: !!resp?.filled, resp: summarizeResponse(resp) }, { trace, ctx });
           sendResponse({ ok: true, filled: !!resp?.filled });
           break;
         }
@@ -406,10 +623,17 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
           // pass only the username through, sites is caller-supplied
           const safeLogin = { username: msg.loginName?.username };
           let cred = pwCacheGet(host, safeLogin.username);
+          const cacheHit = !!cred;
           if (!cred) {
             cred = await client.getPasswordForLoginName(sender.tab.id, frameUrl, safeLogin);
             if (cred) pwCacheSet(host, cred);
           }
+          logUp(
+            "fill.credential",
+            cred ? "info" : "warn",
+            { host, user: maskUser(safeLogin.username), cacheHit, found: !!cred, cached: pwCacheSize() },
+            { trace, ctx },
+          );
           let filled = false;
           if (cred) {
             const resp = await chrome.tabs.sendMessage(
@@ -423,6 +647,12 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
               { frameId },
             );
             filled = !!resp?.filled;
+            logUp(
+              "fill.result",
+              filled ? "info" : "warn",
+              { host, user: maskUser(cred.username), filled, resp: summarizeResponse(resp) },
+              { trace, ctx },
+            );
             if (filled) {
               recordMru(host, cred.username);
               lastFillByTab.set(sender.tab.id, { host, username: cred.username });
@@ -450,7 +680,14 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
 
           // locked: stash a new-password save for unlock, a plain re-login isnt worth deferring
           if (!client.ready) {
-            if (generated || newPwCtx) {
+            const willQueue = generated || newPwCtx;
+            logUp(
+              "save.locked",
+              willQueue ? "info" : "warn",
+              { host, user: maskUser(detected), pwLen: String(msg.password).length, generated, newPwCtx, queued: willQueue },
+              { trace, ctx },
+            );
+            if (willQueue) {
               queuePendingSave({
                 host,
                 frameUrl,
@@ -469,16 +706,21 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
             existing = (await client.getLoginNamesForURL(sender.tab.id, frameUrl))
               .map((l) => l.username)
               .filter(Boolean);
-          } catch {}
+          } catch (e) {
+            // a failed lookup changes the save decision (it looks like "first login here")
+            logUp("save.existing.failed", "warn", { err: errInfo(e) }, { trace, ctx });
+          }
           const target = pickSaveTarget({ host, existing, detected, generated, newPwCtx });
-          console.debug("[Open Passwords] resolveSave", {
+          logUp("save.decide", "info", {
             host,
-            detected: detected || "(none)",
+            user: maskUser(detected),
+            pwLen: String(msg.password).length,
             generated,
             newPwCtx,
             existingCount: existing.length,
-            target: target === null ? "(skip)" : target || "(ask)",
-          });
+            existingUsers: existing.slice(0, 6).map((u) => maskUser(u)),
+            target: target === null ? "(skip)" : target ? maskUser(target) : "(ask)",
+          }, { trace, ctx });
           if (target === null) return sendResponse({ ok: true, saved: false, skipped: true });
           await client.saveLogin(sender.tab.id, frameUrl, target, msg.password);
           sendResponse({ ok: true, saved: true });
@@ -487,9 +729,11 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
 
         case "getState":
           await ensureConnected();
+          logUp("state.get", "debug", { state: client.state, reason: client.stateReason, hasChallenge: client.hasChallenge, autoPairError });
           sendResponse({
             ok: true,
             state: client.state,
+            stateReason: client.stateReason,
             hasChallenge: client.hasChallenge,
             caps: {
               oneTimeCodes: client.canFillOneTimeCodes,
@@ -512,6 +756,7 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
           if (!client.ready) return sendResponse({ ok: true, rows: [] });
           if (!client.canFillOneTimeCodes) return sendResponse({ ok: true, supported: false, rows: [] });
           const { rows, requiresAuth } = await listOneTimeCodes(tab.id, 0, frameUrlsFor({ url: tab.url, tab }));
+          logUp("otp.popup.list", "debug", { tab: tab.id, n: rows.length, requiresAuth });
           sendResponse({ ok: true, supported: true, rows, requiresAuth });
           break;
         }
@@ -529,12 +774,16 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
           try {
             const frames = await new Promise((resolve) =>
               chrome.tabs.sendMessage(tab.id, { type: "fillOtp", code, expectedHost: host }, (r) => {
-                void chrome.runtime.lastError;
+                const err = chrome.runtime.lastError?.message;
+                if (err) logUp("otp.popup.send-error", "warn", { err, host });
                 resolve(r);
               }),
             );
             filled = !!frames?.filled;
-          } catch (_) {}
+          } catch (e) {
+            logUp("otp.popup.fill.failed", "warn", { err: errInfo(e), host });
+          }
+          logUp("otp.popup.fill", filled ? "info" : "warn", { tab: tab.id, host, filled, codeLen: String(code || "").length });
           sendResponse({ ok: true, filled, code });
           break;
         }
@@ -542,6 +791,12 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
         case "openPasswordsApp": {
           const tab = await activeTab();
           const url = tab?.url && /^https?:/i.test(tab.url) ? tab.url : undefined;
+          logUp("app.launch.request", "info", {
+            mode: msg.mode,
+            host: url ? safeUrl(url) : undefined,
+            caps: { newPasswordSheet: client.canOpenPasswordsAppToNewPasswordSheet, setUpTotp: client.canSetUpTotp },
+            uriOk: msg.mode === "totp" ? /^(apple-)?otpauth:\/\//i.test(String(msg.uri || "")) : undefined,
+          }, { trace, ctx });
           await ensureConnected();
           if (msg.mode === "totp") {
             if (!msg.uri || !/^(apple-)?otpauth:\/\//i.test(msg.uri)) return sendResponse({ ok: false, error: "no otpauth URI" });
@@ -556,14 +811,19 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
         }
 
         case "connect":
+          logUp("connect.request", "info", { state: client.state, portOpen: client.port !== undefined }, { trace, ctx });
           await ensureConnected();
-          sendResponse({ ok: true, state: client.state });
+          sendResponse({ ok: true, state: client.state, stateReason: client.stateReason });
           break;
 
         case "requestChallenge":
           // top frame or popup only, so a hostile sub-frame cant spam native prompts
-          if (fromContent && sender.frameId !== 0) return sendResponse({ ok: false, error: "forbidden" });
+          if (fromContent && sender.frameId !== 0) {
+            logUp("challenge.forbidden", "warn", { why: "frameId !== 0", frame: sender.frameId }, { trace, ctx });
+            return sendResponse({ ok: false, error: "forbidden" });
+          }
           await ensureConnected();
+          logUp("challenge.ask", "info", { ifNeeded: !!msg.ifNeeded, hasChallenge: client.hasChallenge, state: client.state }, { trace, ctx });
           await withTimeout(client.requestChallenge({ ifNeeded: !!msg.ifNeeded }), 8000, "challenge timed out");
           // not awaited, the UI shows its PIN box while auto-pair reads the code
           tryAutoPair("request");
@@ -571,8 +831,12 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
           break;
 
         case "verifyPin": {
-          if (fromContent && sender.frameId !== 0) return sendResponse({ ok: false, error: "forbidden" });
+          if (fromContent && sender.frameId !== 0) {
+            logUp("verify.forbidden", "warn", { why: "frameId !== 0", frame: sender.frameId }, { trace, ctx });
+            return sendResponse({ ok: false, error: "forbidden" });
+          }
           await ensureConnected();
+          logUp("verify.ask", "info", { pinLen: String(msg.pin || "").length, from: ctx.route, state: client.state }, { trace, ctx });
           try {
             await withTimeout(client.verifyPin(msg.pin), 8000, "verification timed out");
           } catch (e) {
@@ -582,8 +846,11 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
               try {
                 await withTimeout(client.requestChallenge(), 8000, "challenge timed out");
                 newCode = true;
-              } catch (_) {}
+              } catch (err2) {
+                logUp("verify.reissue.failed", "error", { err: errInfo(err2), state: client.state });
+              }
             }
+            logUp("verify.failed", "warn", { err: errInfo(e), newCode, state: client.state }, { trace, ctx });
             return sendResponse({
               ok: false,
               error: String(e?.message ?? e),
@@ -591,6 +858,7 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
               state: client.state,
             });
           }
+          logUp("verify.ok", "info", { state: client.state }, { trace, ctx });
           sendResponse({ ok: true, state: client.state });
           if (client.ready) flushPendingSaves();
           break;
@@ -599,6 +867,7 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
         case "getLogins": {
           const tab = await activeTab();
           if (!tab?.url) return sendResponse({ ok: false, error: "no active tab" });
+          logUp("popup.logins", "debug", { tab: tab.id, url: safeUrl(tab.url), ready: client.ready });
           const logins = await client.getLoginNamesForURL(tab.id, tab.url);
           sendResponse({ ok: true, logins: uniqueByUsername(orderByMru(registrableHost(tab.url), logins)) });
           break;
@@ -618,10 +887,17 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
             return sendResponse({ ok: false, error: "refusing to fill on a non-HTTPS page" });
           }
           let cred = pwCacheGet(host, msg.loginName?.username);
+          const cacheHit = !!cred;
           if (!cred) {
             cred = await client.getPasswordForLoginName(tab.id, tab.url, msg.loginName);
             if (cred) pwCacheSet(host, cred);
           }
+          logUp(
+            "popup.fill.credential",
+            cred ? "info" : "warn",
+            { host, user: maskUser(msg.loginName?.username), cacheHit, found: !!cred },
+            { trace, ctx },
+          );
           let filled = false;
           if (cred) {
             // content script re-checks expectedHost before filling
@@ -632,6 +908,14 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
               expectedHost: host,
             });
             filled = !!resp?.filled;
+            // tabs.sendMessage without a frameId answers from the first frame, so a
+            // false here can mean "the top frame had nothing, an iframe did"
+            logUp(
+              "popup.fill.result",
+              filled ? "info" : "warn",
+              { host, user: maskUser(cred.username), filled, firstFrameSaid: summarizeResponse(resp) },
+              { trace, ctx },
+            );
             if (filled) {
               recordMru(host, cred.username);
               lastFillByTab.set(tab.id, { host, username: cred.username });
@@ -648,11 +932,20 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
           const entry = tab?.id != null ? lastFillByTab.get(tab.id) : null;
           const host = tab?.url ? registrableHost(tab.url) : null;
           if (!entry || !host || entry.host !== host) {
+            logUp("popup.refill.skip", "debug", {
+              hasEntry: !!entry,
+              host,
+              entryHost: entry?.host,
+              why: !entry ? "nothing filled in this tab" : "host changed",
+            }, { trace, ctx });
             return sendResponse({ ok: true, refilled: false });
           }
           try {
             const cred = await client.getPasswordForLoginName(tab.id, tab.url, { username: entry.username });
-            if (!cred) return sendResponse({ ok: true, refilled: false });
+            if (!cred) {
+              logUp("popup.refill.missing", "warn", { host, user: maskUser(entry.username) }, { trace, ctx });
+              return sendResponse({ ok: true, refilled: false });
+            }
             pwCacheSet(host, cred);
             const resp = await chrome.tabs.sendMessage(tab.id, {
               type: "fill",
@@ -660,27 +953,38 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
               password: cred.password,
               expectedHost: host,
             });
+            logUp("popup.refill", resp?.filled ? "info" : "warn", {
+              host,
+              user: maskUser(cred.username),
+              refilled: !!resp?.filled,
+              firstFrameSaid: summarizeResponse(resp),
+            }, { trace, ctx });
             sendResponse({ ok: true, refilled: !!resp?.filled, username: cred.username });
           } catch (e) {
+            logUp("popup.refill.failed", "warn", { err: errInfo(e), host }, { trace, ctx });
             sendResponse({ ok: true, refilled: false, error: String(e?.message ?? e) });
           }
           break;
         }
 
         case "clearCache":
+          logUp("cache.clear", "debug", { had: pwCacheSize(), fills: lastFillByTab.size }, { trace, ctx });
           pwCacheClear();
           sendResponse({ ok: true });
           break;
 
         case "disconnect":
+          logUp("disconnect.request", "info", { state: client.state }, { trace, ctx });
           client.disconnect();
-          sendResponse({ ok: true, state: client.state });
+          sendResponse({ ok: true, state: client.state, stateReason: client.stateReason });
           break;
 
         default:
+          logUp("msg.unknown", "warn", { type: msg?.type }, { trace, ctx });
           sendResponse({ ok: false, error: "unknown message" });
       }
     } catch (e) {
+      logUp("msg.error", "error", { type: msg?.type, err: errInfo(e), portOpen: client.port !== undefined }, { trace, ctx });
       sendResponse({ ok: false, error: String(e?.message ?? e), state: client.state });
     }
   })();
