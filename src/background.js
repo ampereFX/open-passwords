@@ -1,6 +1,7 @@
 // alarm keep-alive holds the MV3 worker so the PIN isnt re-prompted every idle-out
 
 import { ApplePasswords, State } from "./protocol.js";
+import { schemeClass } from "./hosts.js";
 import { DiagLog, errInfo, maskUser, safeUrl, sanitize } from "./log.js";
 
 const VERSION = chrome.runtime.getManifest().version;
@@ -416,17 +417,11 @@ function registrableHost(u) {
   }
 }
 
-// loopback and RFC 6761 reserved TLDs are the only non-HTTPS origins treated as fillable
-function isLocalDevHost(host) {
-  return (
-    host === "localhost" ||
-    host === "127.0.0.1" ||
-    host === "[::1]" ||
-    host?.endsWith(".localhost") ||
-    host?.endsWith(".test")
-  );
-}
-
+// Where plain HTTP is the norm rather than a red flag: loopback, RFC 6761 reserved
+// TLDs, the private/link-local address ranges and single-label LAN names. Router and
+// NAS admin pages live there and only speak http://, and a fill there still needs an
+// explicit click. A public http:// origin is never fillable: that is the case the
+// guard exists for. The matrix itself lives in hosts.js so it can be tested.
 // only these from a content script, none returns a password to the page
 const CONTENT_ALLOWED = new Set([
   "inlineLogins",
@@ -588,8 +583,9 @@ chrome.runtime.onMessage.addListener((msg, sender, rawRespond) => {
           const frameId = sender.frameId;
           if (!frameUrl || sender.tab?.id == null || frameId == null) return sendResponse({ ok: false, error: "no frame" });
           const host = registrableHost(frameUrl);
-          if (!/^https:\/\//i.test(frameUrl) && !isLocalDevHost(host)) {
-            return sendResponse({ ok: false, error: "refusing to fill on a non-HTTPS frame" });
+          if (schemeClass(frameUrl, host) === "http-public") {
+            logUp("otp.refused", "warn", { host, why: "plain HTTP on a public host" }, { trace, ctx });
+            return sendResponse({ ok: false, error: "refusing to fill on a non-HTTPS frame", reason: "insecure-origin" });
           }
           const code = await resolveOneTimeCode(sender.tab.id, Number(msg.id));
           logUp("otp.fill", "info", { id: msg.id, codeLen: String(code || "").length, expectedHost: host }, { trace, ctx });
@@ -611,14 +607,10 @@ chrome.runtime.onMessage.addListener((msg, sender, rawRespond) => {
             return sendResponse({ ok: false, error: "no frame" });
           }
           const host = registrableHost(frameUrl);
-          const isLocalDev =
-            host === "localhost" ||
-            host === "127.0.0.1" ||
-            host === "[::1]" ||
-            host?.endsWith(".localhost") ||
-            host?.endsWith(".test");
-          if (!/^https:\/\//i.test(frameUrl) && !isLocalDev) {
-            return sendResponse({ ok: false, error: "refusing to fill on a non-HTTPS frame" });
+          const scheme = schemeClass(frameUrl, host);
+          if (scheme === "http-public") {
+            logUp("fill.refused", "warn", { host, scheme, why: "plain HTTP on a public host" }, { trace, ctx });
+            return sendResponse({ ok: false, error: "refusing to fill on a non-HTTPS frame", reason: "insecure-origin" });
           }
           // pass only the username through, sites is caller-supplied
           const safeLogin = { username: msg.loginName?.username };
@@ -631,10 +623,20 @@ chrome.runtime.onMessage.addListener((msg, sender, rawRespond) => {
           logUp(
             "fill.credential",
             cred ? "info" : "warn",
-            { host, user: maskUser(safeLogin.username), cacheHit, found: !!cred, cached: pwCacheSize() },
+            {
+              host,
+              scheme,
+              // plain HTTP on a LAN address works (routers, NAS) but is worth seeing in a report
+              insecure: scheme === "http-local",
+              user: maskUser(safeLogin.username),
+              cacheHit,
+              found: !!cred,
+              cached: pwCacheSize(),
+            },
             { trace, ctx },
           );
           let filled = false;
+          let reply;
           if (cred) {
             const resp = await chrome.tabs.sendMessage(
               sender.tab.id,
@@ -647,10 +649,11 @@ chrome.runtime.onMessage.addListener((msg, sender, rawRespond) => {
               { frameId },
             );
             filled = !!resp?.filled;
+            reply = resp;
             logUp(
               "fill.result",
               filled ? "info" : "warn",
-              { host, user: maskUser(cred.username), filled, resp: summarizeResponse(resp) },
+              { host, scheme, user: maskUser(cred.username), filled, resp: summarizeResponse(resp) },
               { trace, ctx },
             );
             if (filled) {
@@ -658,7 +661,11 @@ chrome.runtime.onMessage.addListener((msg, sender, rawRespond) => {
               lastFillByTab.set(sender.tab.id, { host, username: cred.username });
             }
           }
-          sendResponse({ ok: true, filled });
+          // a reason the content script can turn into a visible message instead of a silent no-op
+          let reason;
+          if (!cred) reason = "no-credential";
+          else if (!filled) reason = reply?.reason || "no-field";
+          sendResponse({ ok: true, filled, reason });
           break;
         }
 
@@ -669,8 +676,9 @@ chrome.runtime.onMessage.addListener((msg, sender, rawRespond) => {
             return sendResponse({ ok: false, error: "no frame" });
           }
           const host = registrableHost(frameUrl);
-          if (!/^https:\/\//i.test(frameUrl) && !isLocalDevHost(host)) {
-            return sendResponse({ ok: false, error: "refusing to save from a non-HTTPS frame" });
+          if (schemeClass(frameUrl, host) === "http-public") {
+            logUp("save.refused", "warn", { host, why: "plain HTTP on a public host" }, { trace, ctx });
+            return sendResponse({ ok: false, error: "refusing to save from a non-HTTPS frame", reason: "insecure-origin" });
           }
           if (!msg.password) return sendResponse({ ok: false, error: "no password" });
           const detected = (msg.username || "").trim();
@@ -766,8 +774,9 @@ chrome.runtime.onMessage.addListener((msg, sender, rawRespond) => {
           const tab = await activeTab();
           if (!tab?.url) return sendResponse({ ok: false, error: "no active tab" });
           const host = registrableHost(tab.url);
-          if (!/^https:\/\//i.test(tab.url) && !isLocalDevHost(host)) {
-            return sendResponse({ ok: false, error: "refusing to fill on a non-HTTPS page" });
+          if (schemeClass(tab.url, host) === "http-public") {
+            logUp("otp.refused", "warn", { host, why: "plain HTTP on a public host" }, { trace, ctx });
+            return sendResponse({ ok: false, error: "refusing to fill on a non-HTTPS page", reason: "insecure-origin" });
           }
           const code = await resolveOneTimeCode(tab.id, Number(msg.id));
           let filled = false;
@@ -877,14 +886,10 @@ chrome.runtime.onMessage.addListener((msg, sender, rawRespond) => {
           const tab = await activeTab();
           if (!tab?.url) return sendResponse({ ok: false, error: "no active tab" });
           const host = registrableHost(tab.url);
-          const isLocalDev =
-            host === "localhost" ||
-            host === "127.0.0.1" ||
-            host === "[::1]" ||
-            host?.endsWith(".localhost") ||
-            host?.endsWith(".test");
-          if (!/^https:\/\//i.test(tab.url) && !isLocalDev) {
-            return sendResponse({ ok: false, error: "refusing to fill on a non-HTTPS page" });
+          const scheme = schemeClass(tab.url, host);
+          if (scheme === "http-public") {
+            logUp("fill.refused", "warn", { host, scheme, why: "plain HTTP on a public host" }, { trace, ctx });
+            return sendResponse({ ok: false, error: "refusing to fill on a non-HTTPS page", reason: "insecure-origin" });
           }
           let cred = pwCacheGet(host, msg.loginName?.username);
           const cacheHit = !!cred;
@@ -895,10 +900,18 @@ chrome.runtime.onMessage.addListener((msg, sender, rawRespond) => {
           logUp(
             "popup.fill.credential",
             cred ? "info" : "warn",
-            { host, user: maskUser(msg.loginName?.username), cacheHit, found: !!cred },
+            {
+              host,
+              scheme,
+              insecure: scheme === "http-local",
+              user: maskUser(msg.loginName?.username),
+              cacheHit,
+              found: !!cred,
+            },
             { trace, ctx },
           );
           let filled = false;
+          let reply;
           if (cred) {
             // content script re-checks expectedHost before filling
             const resp = await chrome.tabs.sendMessage(tab.id, {
@@ -908,12 +921,13 @@ chrome.runtime.onMessage.addListener((msg, sender, rawRespond) => {
               expectedHost: host,
             });
             filled = !!resp?.filled;
+            reply = resp;
             // tabs.sendMessage without a frameId answers from the first frame, so a
             // false here can mean "the top frame had nothing, an iframe did"
             logUp(
               "popup.fill.result",
               filled ? "info" : "warn",
-              { host, user: maskUser(cred.username), filled, firstFrameSaid: summarizeResponse(resp) },
+              { host, scheme, user: maskUser(cred.username), filled, firstFrameSaid: summarizeResponse(resp) },
               { trace, ctx },
             );
             if (filled) {
@@ -921,7 +935,10 @@ chrome.runtime.onMessage.addListener((msg, sender, rawRespond) => {
               lastFillByTab.set(tab.id, { host, username: cred.username });
             }
           }
-          sendResponse({ ok: true, filled });
+          let reason;
+          if (!cred) reason = "no-credential";
+          else if (!filled) reason = reply?.reason || "no-field";
+          sendResponse({ ok: true, filled, reason });
           break;
         }
 
@@ -959,7 +976,12 @@ chrome.runtime.onMessage.addListener((msg, sender, rawRespond) => {
               refilled: !!resp?.filled,
               firstFrameSaid: summarizeResponse(resp),
             }, { trace, ctx });
-            sendResponse({ ok: true, refilled: !!resp?.filled, username: cred.username });
+            sendResponse({
+              ok: true,
+              refilled: !!resp?.filled,
+              reason: resp?.filled ? undefined : resp?.reason || "no-field",
+              username: cred.username,
+            });
           } catch (e) {
             logUp("popup.refill.failed", "warn", { err: errInfo(e), host }, { trace, ctx });
             sendResponse({ ok: true, refilled: false, error: String(e?.message ?? e) });

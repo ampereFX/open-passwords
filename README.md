@@ -125,6 +125,15 @@ PasswordManagerBrowserExtensionHelper (macOS native, talks to iCloud Keychain)
 
 ## Troubleshooting
 
+### The dropdown lists a login, but clicking it does nothing
+
+It no longer does *nothing*: a refused fill now says why, next to the field. The usual reasons:
+
+- **the page is plain HTTP on a public host.** Passwords are only filled into `https://`, or into `http://` on your own network (localhost, `10/8`, `172.16/12`, `192.168/16`, `169.254/16`, `*.local`, `*.lan`, `*.test`, `*.home.arpa`, `*.internal`, single-label names like `http://router/`). That covers router and NAS admin pages, which never have HTTPS
+- **the page address changed** between opening the dropdown and clicking
+- **no password field is left** on the page that can be filled safely
+- **the vault is locked**, or Apple's helper did not answer
+
 ### Your Mac shows a code, but the extension says it is incorrect
 
 A code belongs to one handshake. The helper ends that handshake as soon as it checks a code, right or wrong. A new handshake puts a new code on screen and ends the old one. The old prompt can stay visible after its code is dead.
@@ -166,6 +175,7 @@ The buffer lives in `chrome.storage.session`: it survives a service-worker resta
 - every password query is AES-GCM encrypted end to end with the helper
 - the PIN only derives the SRP shared key, it isn't stored
 - reading a password can trigger a Touch ID prompt, that prompt comes from the helper
+- a fill is refused on a public plain-`http://` page (the phishing case). plain HTTP is accepted only for loopback, private/link-local addresses and `.local`-style names, and it is logged as `insecure: true`
 - the diagnostics export contains hostnames and the extension's decisions, never credentials; review it before sharing
 
 ## Credits

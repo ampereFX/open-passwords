@@ -30,7 +30,7 @@ from.
 ## Tests
 
 ```bash
-npm test                                   # log redaction self-test
+npm test                                   # log redaction + plain-HTTP fill guard self-tests
 cd test-harness/automation
 node build-test-extensions.mjs             # mock builds, no macOS helper needed
 node run-all.mjs                           # needs playwright + a server on :8799

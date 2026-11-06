@@ -237,6 +237,21 @@ async function render(state) {
   show("connecting");
 }
 
+// one sentence the user can act on, instead of a button that does nothing
+function fillErrorText(res) {
+  const reason = String(res?.reason || "");
+  const err = String(res?.error || "");
+  if (/insecure-origin|non-HTTPS/i.test(err) || reason === "insecure-origin") {
+    return "Not filled: this page is plain HTTP, so the password stays in the vault.";
+  }
+  if (/origin mismatch/i.test(err)) return "Not filled: the page address changed while filling.";
+  if (/not unlocked|not connected|locked/i.test(err)) return "Not filled: the vault is locked.";
+  if (/timeout|did not answer|no response/i.test(err)) return "Not filled: Apple's helper did not answer.";
+  if (reason === "no-credential") return "Not filled: no saved password for this account on this site.";
+  if (reason === "no-field" || reason === "partial") return "Not filled: this page has no password field I can safely target.";
+  return err ? `Not filled: ${err}` : "Not filled.";
+}
+
 async function renderLogins() {
   const tab = await activeTab();
   document.getElementById("site").textContent = tab?.url ? new URL(tab.url).hostname : "";
@@ -266,7 +281,10 @@ async function renderLogins() {
       fill.disabled = true;
       const r = await send({ type: "fillOnPage", tabId: tab.id, url: tab.url, loginName: login });
       if (r?.ok && r.filled) window.close();
-      else fill.disabled = false;
+      else {
+        fill.disabled = false;
+        flashNote(fillErrorText(r));
+      }
     });
     li.append(u, fill);
     list.appendChild(li);
@@ -407,6 +425,7 @@ refreshBtn.addEventListener("click", async () => {
     await renderLogins();
     renderCodes();
     if (r?.refilled) flashNote(`Re-filled ${r.username} with the latest password`);
+    else if (r?.reason) flashNote(fillErrorText(r));
     else flashNote("Passwords refreshed");
   }
   refreshBtn.classList.remove("spinning");

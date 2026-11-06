@@ -4,7 +4,7 @@
 // A classic content script cannot import log.js, so this is a thin producer: it posts
 // events to the worker, which owns the buffer and applies the redaction whitelist.
 // Never put a field value in here, only shape, counts and decisions.
-const OP_BUILD = "0.50.0";
+const OP_BUILD = "0.51.0";
 let opTraceSeq = 0;
 let opTrace = "boot";
 let opQueue = [];
@@ -289,6 +289,7 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
   const anchor = liveField(fillAnchor);
   const filled = fillCredentials(msg.username, msg.password, anchor, report);
   report.anchorRelookup = !!fillAnchor && anchor !== fillAnchor;
+  const reason = filled ? undefined : report.pwTarget || report.userTarget ? "partial" : "no-field";
   opLog(filled ? "fill.run" : "fill.run.empty", filled ? "info" : "warn", {
     gotUser: !!msg.username,
     gotPw: !!msg.password,
@@ -297,7 +298,7 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
   });
   // a submit right after must not re-offer to save this existing login
   if (filled) lastAutofill = { host: location.hostname, username: msg.username, password: msg.password, at: Date.now() };
-  sendResponse({ ok: true, filled });
+  sendResponse({ ok: true, filled, reason });
   return true;
 });
 
@@ -569,6 +570,71 @@ function glassify(el) {
   );
 }
 
+// A refused fill used to be a silent no-op: the dropdown closed and nothing else
+// happened. Every refused fill now says why, next to the field, for a few seconds.
+let fillErrorEl = null;
+let fillErrorTimer = null;
+
+function hideFillError() {
+  clearTimeout(fillErrorTimer);
+  fillErrorTimer = null;
+  if (fillErrorEl) fillErrorEl.remove();
+  fillErrorEl = null;
+}
+
+function showFillError(field, text) {
+  if (!text) return;
+  hideFillError();
+  ensureFontFace();
+  const el = document.createElement("div");
+  el.setAttribute("data-open-passwords", "fill-error");
+  el.setAttribute("role", "status");
+  el.textContent = text;
+  glassify(el);
+  Object.assign(el.style, {
+    position: "absolute",
+    zIndex: "2147483647",
+    padding: "8px 11px",
+    maxWidth: "320px",
+    fontSize: "12px",
+    lineHeight: "1.35",
+  });
+  el.style.setProperty("background", "light-dark(rgba(255,246,245,0.95), rgba(48,28,28,0.92))");
+  el.style.setProperty("color", "light-dark(#B3261E, #FFB4AB)");
+  el.style.setProperty("border-color", "light-dark(rgba(179,38,30,0.30), rgba(255,180,171,0.35))");
+  el.addEventListener("click", hideFillError);
+  el.addEventListener("mousedown", (e) => e.stopPropagation());
+  (document.body || document.documentElement).appendChild(el);
+  const anchor = field && field.isConnected ? field : null;
+  const r = anchor?.getBoundingClientRect();
+  const vw = window.innerWidth || document.documentElement.clientWidth;
+  if (r) {
+    el.style.left = `${window.scrollX + Math.max(8, Math.min(r.left, vw - 330))}px`;
+    el.style.top = `${window.scrollY + r.bottom + 6}px`;
+  } else {
+    el.style.left = `${window.scrollX + Math.max(8, (vw - 320) / 2)}px`;
+    el.style.top = `${window.scrollY + 24}px`;
+  }
+  fillErrorEl = el;
+  fillErrorTimer = setTimeout(hideFillError, 7000);
+  opLog("fill.error-shown", "info", { text });
+}
+
+// turn a machine-readable reason (plus the background's error) into one sentence
+function fillErrorText(res, fallback) {
+  const reason = String(res?.reason || "");
+  const err = String(res?.error || "");
+  if (/insecure-origin|non-HTTPS/i.test(err) || reason === "insecure-origin") {
+    return "Not filled: this page is plain HTTP, so the password stays in the vault.";
+  }
+  if (/origin mismatch/i.test(err)) return "Not filled: the page address changed while filling.";
+  if (/not unlocked|not connected|locked/i.test(err)) return "Not filled: the vault is locked. Unlock it first.";
+  if (/timeout|did not answer|no response/i.test(err)) return "Not filled: Apple's helper did not answer. Try again.";
+  if (reason === "no-credential") return "Not filled: no saved password for this account on this site.";
+  if (reason === "no-field" || reason === "partial") return "Not filled: this page has no password field I can safely target.";
+  return err ? `Not filled: ${err}` : fallback || "Not filled.";
+}
+
 function buildSuggestionBox(field) {
   removeSuggestion();
   ensureFontFace();
@@ -692,7 +758,10 @@ async function buildLockedSuggestion(field, onUnlock) {
       fillAnchor = field;
       chrome.runtime
         .sendMessage({ type: "inlineFill", loginName: cachedLogins[0], trace: opTrace })
-        .then((r) => opLog("unlock.autofill", r?.filled ? "info" : "warn", { ok: r?.ok, filled: r?.filled, error: r?.error }))
+        .then((r) => {
+          opLog("unlock.autofill", r?.filled ? "info" : "warn", { ok: r?.ok, filled: r?.filled, error: r?.error, reason: r?.reason });
+          if (!r?.filled) showFillError(liveField(field), fillErrorText(r, "Not filled: the password did not go in."));
+        })
         .catch(() => {});
     } else if (cachedLogins.length > 1) {
       buildChooser(field, cachedLogins);
@@ -862,9 +931,11 @@ function appendLoginRows(box, field, logins) {
           opLog(
             r && r.ok === false ? "pick.login.failed" : r && r.filled ? "pick.login.filled" : "pick.login.empty",
             r && (r.ok === false || !r.filled) ? "warn" : "info",
-            { res: r ? { ok: r.ok, filled: r.filled, error: r.error, state: r.state } : "(no response)" },
+            { res: r ? { ok: r.ok, filled: r.filled, error: r.error, reason: r.reason, state: r.state } : "(no response)" },
             { trace },
           );
+          // the dropdown is gone, so this is the only place the user can learn why
+          if (!r || r.ok === false || !r.filled) showFillError(liveField(field), fillErrorText(r, "Not filled: the password did not go in."));
         })
         .catch((e) => opLog("pick.login.failed", "error", { err: String(e?.message ?? e) }, { trace }));
     });
@@ -1105,9 +1176,12 @@ function appendOneTimeCodeRows(box, field, rows) {
           opLog(
             res && res.ok === false ? "pick.otp.failed" : res && res.filled ? "pick.otp.filled" : "pick.otp.empty",
             res && res.filled ? "info" : "warn",
-            { res: res ? { ok: res.ok, filled: res.filled, error: res.error } : "(no response)" },
+            { res: res ? { ok: res.ok, filled: res.filled, error: res.error, reason: res.reason } : "(no response)" },
             { trace },
           );
+          if (!res || res.ok === false || !res.filled) {
+            showFillError(liveField(field), fillErrorText(res, "Not filled: no verification-code field found."));
+          }
         })
         .catch((e) => opLog("pick.otp.failed", "error", { err: String(e?.message ?? e) }, { trace }));
     });
@@ -1262,6 +1336,7 @@ function frameIsSafe() {
 async function onFocusIn(e) {
   // focusin from inside a shadow root retargets to the host, composedPath has the real input
   const field = (e.composedPath ? e.composedPath()[0] : null) || e.target;
+  if (field instanceof HTMLInputElement) hideFillError();
   if (field instanceof HTMLInputElement && field.type === "password") everPassword.add(field);
   if (!(field instanceof HTMLInputElement)) {
     opLog("focus.skip", "debug", { why: "not an input", tag: String(field?.tagName || "?").toLowerCase() });
