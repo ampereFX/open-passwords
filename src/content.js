@@ -4,7 +4,7 @@
 // A classic content script cannot import log.js, so this is a thin producer: it posts
 // events to the worker, which owns the buffer and applies the redaction whitelist.
 // Never put a field value in here, only shape, counts and decisions.
-const OP_BUILD = "0.59.0";
+const OP_BUILD = "0.60.0";
 let opTraceSeq = 0;
 let opTrace = "boot";
 let opQueue = [];
@@ -314,7 +314,11 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
     ...report,
   });
   // a submit right after must not re-offer to save this existing login
-  if (filled) lastAutofill = { host: location.hostname, username: msg.username, password: msg.password, at: Date.now() };
+  if (filled) {
+    lastAutofill = { host: location.hostname, username: msg.username, password: msg.password, at: Date.now() };
+    // a list opened meanwhile (focus came back first, the fill second) is stale now
+    removeSuggestion();
+  }
   sendResponse({ ok: true, filled, reason });
   return true;
 });
@@ -612,9 +616,15 @@ function hideFillError() {
 // looks like the extension silently ignored the click
 const AUTH_HINT_DELAY_MS = 800;
 const AUTH_HINT_TEXT = "Waiting for macOS: confirm with Touch ID or your Mac password.";
+// while a picked login is being read and filled, focus events are not the user asking
+// for the list: closing the Touch ID sheet hands focus back to the field just before
+// the fill lands, and that focusin re-opened the list over the sign-in button
+let fillsInFlight = 0;
 function fillWithAuthHint(field, promise) {
   const t = setTimeout(() => showFillError(field, AUTH_HINT_TEXT, { tone: "info", sticky: true }), AUTH_HINT_DELAY_MS);
+  fillsInFlight += 1;
   return promise.finally(() => {
+    fillsInFlight = Math.max(0, fillsInFlight - 1);
     clearTimeout(t);
     if (fillErrorEl?.textContent === AUTH_HINT_TEXT) hideFillError();
   });
@@ -1122,6 +1132,8 @@ function deepActiveElement() {
 
 // a stale async read from an earlier focus must not draw over a newer one
 let offerSeq = 0;
+// the field whose list is being fetched, so the click that follows its focus does not ask twice
+let offerPendingFor = null;
 
 // fetch before building so an empty result never flashes a box on then off
 async function buildOfferSuggestion(field) {
@@ -1129,18 +1141,25 @@ async function buildOfferSuggestion(field) {
   opTrace = trace;
   const hasGenerator = isNewPasswordField(field);
   const seq = ++offerSeq;
+  const startedAt = Date.now();
   const verdict = explainLoginField(field);
   opLog("offer.start", "debug", { field: fieldInfo(field), verdict: verdict.reason, generator: hasGenerator, seq }, { trace });
 
+  offerPendingFor = field;
   let res;
   try {
     res = await chrome.runtime.sendMessage({ type: "inlineLogins", trace });
   } catch (e) {
     res = null;
     opLog("offer.send.failed", "warn", { err: String(e?.message ?? e) }, { trace });
+  } finally {
+    if (offerPendingFor === field) offerPendingFor = null;
   }
-  if (seq !== offerSeq || field !== deepActiveElement()) {
-    opLog("offer.dropped", "debug", { why: seq !== offerSeq ? "newer offer started" : "field lost focus", seq, now: offerSeq }, { trace });
+  const filledMeanwhile = !!lastAutofill && lastAutofill.at >= startedAt;
+  if (seq !== offerSeq || field !== deepActiveElement() || filledMeanwhile || fillsInFlight) {
+    const why =
+      seq !== offerSeq ? "newer offer started" : field !== deepActiveElement() ? "field lost focus" : "a fill ran meanwhile";
+    opLog("offer.dropped", "debug", { why, seq, now: offerSeq }, { trace });
     return;
   }
 
@@ -1344,11 +1363,14 @@ async function buildOneTimeCodeSuggestion(field) {
   const seq = ++offerSeq;
   const group = otpBoxGroup(field);
   let res;
+  offerPendingFor = field;
   try {
     res = await chrome.runtime.sendMessage({ type: "inlineOneTimeCodes", trace });
   } catch (e) {
     opLog("otp.offer.send.failed", "warn", { err: String(e?.message ?? e) }, { trace });
     return;
+  } finally {
+    if (offerPendingFor === field) offerPendingFor = null;
   }
   if (seq !== offerSeq) {
     opLog("otp.offer.dropped", "debug", { why: "newer offer started", seq, now: offerSeq }, { trace });
@@ -1503,6 +1525,10 @@ async function onFocusIn(e) {
   }
   if (!verdict.ok) return;
   if (!frameIsSafe()) return;
+  if (fillsInFlight) {
+    opLog("focus.skip", "debug", { why: "fill in progress (focus back from the macOS prompt)" });
+    return;
+  }
   // still offer on a pre-filled field (apple/chrome do), only stay quiet if we just filled it
   const v = (field.value || "").trim();
   if (v) {
@@ -1521,6 +1547,27 @@ async function onFocusIn(e) {
 }
 
 document.addEventListener("focusin", onFocusIn, true);
+// a field that already has focus (autofocus on load, or the list was closed with Escape
+// or by picking) gets no new focusin, so clicking it again did nothing. A click on the
+// focused field with no list showing for it opens the list, like Safari does
+document.addEventListener(
+  "click",
+  (e) => {
+    if (!e.isTrusted) return;
+    const field = (e.composedPath ? e.composedPath()[0] : null) || e.target;
+    if (!(field instanceof HTMLInputElement) || field !== deepActiveElement()) return;
+    if ((suggestionEl && anchorField === field) || offerPendingFor === field || fillsInFlight) return;
+    if (!isVisible(field) || !frameIsSafe()) return;
+    if (isOtpField(field)) {
+      opLog("click.reopen", "debug", { kind: "otp", field: fieldInfo(field) });
+      buildOneTimeCodeSuggestion(field);
+    } else if (isLoginField(field)) {
+      opLog("click.reopen", "debug", { kind: "login", field: fieldInfo(field) });
+      buildOfferSuggestion(field);
+    }
+  },
+  true,
+);
 // capture so Enter is intercepted before the page's own submit handling
 document.addEventListener("keydown", onSuggestionKeydown, true);
 // focusing auto-scrolls the field, which used to fire this and kill the offer
