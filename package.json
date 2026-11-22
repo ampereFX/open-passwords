@@ -1,6 +1,6 @@
 {
   "name": "open-passwords",
-  "version": "0.56.0",
+  "version": "0.57.0",
   "private": true,
   "type": "module",
   "description": "Open Passwords \u2014 Chrome client for Apple Passwords. This file exists for the JS self-tests only; the extension itself is loaded unpacked.",

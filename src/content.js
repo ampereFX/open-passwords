@@ -4,7 +4,7 @@
 // A classic content script cannot import log.js, so this is a thin producer: it posts
 // events to the worker, which owns the buffer and applies the redaction whitelist.
 // Never put a field value in here, only shape, counts and decisions.
-const OP_BUILD = "0.56.0";
+const OP_BUILD = "0.57.0";
 let opTraceSeq = 0;
 let opTrace = "boot";
 let opQueue = [];
@@ -674,15 +674,24 @@ function buildSuggestionBox(field) {
   removeSuggestion();
   ensureFontFace();
   anchorField = field;
+  // the rows (saved usernames) and the inline PIN field live in a closed shadow root:
+  // in the page DOM, page scripts could read the usernames, read the PIN as it was
+  // typed, and fire a synthetic input event to submit a wrong PIN and burn the code
+  const host = document.createElement("div");
+  host.setAttribute("data-open-passwords", "suggestions");
+  // all:initial stops the page's inherited font/colour/alignment from leaking in
+  host.style.setProperty("all", "initial");
+  Object.assign(host.style, {
+    position: "absolute",
+    zIndex: "2147483647",
+    display: "block",
+  });
+  const shadow = host.attachShadow({ mode: "closed" });
   const box = document.createElement("div");
-  box.setAttribute("data-open-passwords", "suggestions");
   box.setAttribute("role", "listbox");
   box.setAttribute("aria-label", "Open Passwords suggestions");
   glassify(box);
-  Object.assign(box.style, {
-    position: "absolute",
-    zIndex: "2147483647",
-  });
+  shadow.appendChild(box);
   const header = document.createElement("div");
   header.textContent = "Open Passwords";
   Object.assign(header.style, {
@@ -694,8 +703,9 @@ function buildSuggestionBox(field) {
     borderBottom: "1px solid rgba(128,128,128,0.18)",
   });
   box.appendChild(header);
-  document.body.appendChild(box);
-  suggestionEl = box;
+  (document.body || document.documentElement).appendChild(host);
+  // positioning and outside-click checks work on the host; rows go into the box
+  suggestionEl = host;
   positionBox();
   return box;
 }
@@ -842,9 +852,15 @@ async function buildLockedSuggestion(field, onUnlock) {
     if (!e.isTrusted) return;
     if (e.key === "Enter") doVerify();
   });
-  input.addEventListener("input", () => {
+  input.addEventListener("input", (e) => {
+    if (!e.isTrusted) return;
     if (input.value.trim().length === 6) doVerify();
   });
+  // keystrokes still cross the shadow boundary; keep them out of the page's
+  // bubble-phase listeners (capture-phase ones on window can't be stopped from here)
+  for (const t of ["keydown", "keyup", "keypress", "input", "beforeinput"]) {
+    input.addEventListener(t, (e) => e.stopPropagation());
+  }
 
   setTimeout(() => input.focus(), 0);
 }

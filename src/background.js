@@ -45,7 +45,7 @@ const client = new ApplePasswords({
 client.onStateChange((s) => {
   if (s !== State.Unlocked) {
     pwCacheClear();
-    otpByTab.clear();
+    otpLists.clear();
   }
   logUp("state.broadcast", "info", {
     state: s,
@@ -122,15 +122,21 @@ client.onOneTimeCodeAvailable(async () => {
     const tab = await activeTab();
     logUp("otp.available", "info", { tab: tab?.id, host: tab?.url ? safeUrl(tab.url) : undefined });
     if (tab?.id == null) return;
-    otpByTab.delete(tab.id);
+    otpForgetTab(tab.id);
     chrome.tabs.sendMessage(tab.id, { type: "oneTimeCodeAvailable" }).catch(() => {});
   } catch (e) {
     logUp("otp.available.failed", "warn", { err: errInfo(e) });
   }
 });
 
-// rows resolve by id so the page never chooses the username/domain
-const otpByTab = new Map();
+// rows resolve by id so the page never chooses the username/domain. keyed per frame:
+// per tab, an iframe listing its own codes replaced the top frame's list, and a pick
+// in the top frame then resolved its id against the iframe's entries
+const otpLists = new Map();
+const otpKey = (tabId, frameId) => `${tabId}:${frameId ?? 0}`;
+function otpForgetTab(tabId) {
+  for (const k of [...otpLists.keys()]) if (k.startsWith(`${tabId}:`)) otpLists.delete(k);
+}
 const OTP_LIST_TTL_MS = 120_000;
 
 // apple walks the whole parent chain via webNavigation, the top URL covers a same-site iframe without another permission
@@ -149,7 +155,7 @@ function otpRow(e, i) {
 
 async function listOneTimeCodes(tabId, frameId, frameUrls) {
   const { entries, requiresAuth } = await client.getOneTimeCodes(tabId, frameId, frameUrls);
-  otpByTab.set(tabId, { at: Date.now(), entries, frameId, frameUrls });
+  otpLists.set(otpKey(tabId, frameId), { at: Date.now(), entries, frameId, frameUrls });
   logUp("otp.list", "debug", {
     tab: tabId,
     frame: frameId,
@@ -162,8 +168,8 @@ async function listOneTimeCodes(tabId, frameId, frameUrls) {
 }
 
 // TOTP is re-read now, the value rotates and this read triggers Touch ID when the vault demands it
-async function resolveOneTimeCode(tabId, id) {
-  const cached = otpByTab.get(tabId);
+async function resolveOneTimeCode(tabId, frameId, id) {
+  const cached = otpLists.get(otpKey(tabId, frameId));
   const age = cached ? Date.now() - cached.at : -1;
   if (!cached || age > OTP_LIST_TTL_MS) {
     logUp("otp.resolve.failed", "warn", { tab: tabId, id, why: cached ? "list expired" : "no list", age });
@@ -179,18 +185,16 @@ async function resolveOneTimeCode(tabId, id) {
     return entry.code;
   }
   const fresh = await client.readOneTimeCode(tabId, cached.frameId, cached.frameUrls, entry.username);
-  const match =
-    fresh.find((e) => e.source === "totp" && e.username === entry.username && e.domain === entry.domain) ||
-    fresh.find((e) => e.source === "totp");
+  // exact account only: "any TOTP" could fill another account's code for this site
+  const match = fresh.find((e) => e.source === "totp" && e.username === entry.username && e.domain === entry.domain);
   if (!match?.code) {
-    logUp("otp.resolve.failed", "warn", { tab: tabId, id, why: "no totp in fresh read", n: fresh.length });
-    throw new Error("no code returned");
+    logUp("otp.resolve.failed", "warn", { tab: tabId, id, why: "no matching totp in fresh read", n: fresh.length });
+    throw new Error("the code for this account is no longer there, focus the field again");
   }
   logUp("otp.resolve", "debug", {
     tab: tabId,
     id,
     source: "totp",
-    exactMatch: !!(match.username === entry.username && match.domain === entry.domain),
     codeLen: String(match.code).length,
   });
   return match.code;
@@ -604,7 +608,7 @@ chrome.runtime.onMessage.addListener((msg, sender, rawRespond) => {
             logUp("otp.refused", "warn", { host, why: "plain HTTP on a public host" }, { trace, ctx });
             return sendResponse({ ok: false, error: "refusing to fill on a non-HTTPS frame", reason: "insecure-origin" });
           }
-          const code = await resolveOneTimeCode(sender.tab.id, Number(msg.id));
+          const code = await resolveOneTimeCode(sender.tab.id, frameId, Number(msg.id));
           logUp("otp.fill", "info", { id: msg.id, codeLen: String(code || "").length, expectedHost: host }, { trace, ctx });
           const resp = await chrome.tabs.sendMessage(
             sender.tab.id,
@@ -795,7 +799,7 @@ chrome.runtime.onMessage.addListener((msg, sender, rawRespond) => {
             logUp("otp.refused", "warn", { host, why: "plain HTTP on a public host" }, { trace, ctx });
             return sendResponse({ ok: false, error: "refusing to fill on a non-HTTPS page", reason: "insecure-origin" });
           }
-          const code = await resolveOneTimeCode(tab.id, Number(msg.id));
+          const code = await resolveOneTimeCode(tab.id, 0, Number(msg.id));
           let filled = false;
           try {
             const frames = await new Promise((resolve) =>
