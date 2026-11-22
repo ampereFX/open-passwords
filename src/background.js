@@ -945,6 +945,9 @@ chrome.runtime.onMessage.addListener((msg, sender, rawRespond) => {
         case "refreshAndRefill": {
           // re-fill so a password changed in the Passwords app lands without re-clicking Fill
           pwCacheClear();
+          // refresh is also the user's way out of a request the helper never answered
+          const aborted = client.abortStale(3000, "user pressed refresh");
+          if (aborted) logUp("popup.refresh.unstuck", "warn", { aborted }, { trace, ctx });
           const tab = await activeTab();
           const entry = tab?.id != null ? lastFillByTab.get(tab.id) : null;
           const host = tab?.url ? registrableHost(tab.url) : null;

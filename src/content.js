@@ -4,7 +4,7 @@
 // A classic content script cannot import log.js, so this is a thin producer: it posts
 // events to the worker, which owns the buffer and applies the redaction whitelist.
 // Never put a field value in here, only shape, counts and decisions.
-const OP_BUILD = "0.51.0";
+const OP_BUILD = "0.52.0";
 let opTraceSeq = 0;
 let opTrace = "boot";
 let opQueue = [];

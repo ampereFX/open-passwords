@@ -18,6 +18,12 @@ const BROWSER_NAME = "Chrome";
 const VERSION = "1.0";
 // past this we re-prompt instead of verifying against a code the user lost track of
 const CHALLENGE_TTL_MS = 3 * 60_000;
+// requests that may wait on Touch ID. generous, but never unbounded: everything is
+// serialized behind one lock, so a reply that never comes would stall every later
+// request until the browser restarts the extension
+const AUTH_TIMEOUT_MS = 90_000;
+// how long a lookup waits for its turn before reporting "busy" instead of hanging
+const LOCK_WAIT_MS = 10_000;
 
 // callers show "new code" wording for this, retyping the old code can never work
 function challengeError(message) {
@@ -46,6 +52,10 @@ export const Command = {
   SET_UP_TOTP_GENERATOR: 18, // status reply to the set-up-TOTP variant of cmd 13
   OPEN_URL_IN_SAFARI: 1984,
 };
+
+// replies carry a secret: one that may belong to an abandoned request is refused
+// rather than filled, since it could be another site's password
+const SECRET_CMDS = new Set([Command.GET_PASSWORD_FOR_LOGIN_NAME, Command.DID_FILL_ONE_TIME_CODE]);
 
 const QueryId = {
   [4]: "CmdGetLoginNames4URL",
@@ -107,15 +117,69 @@ export class ApplePasswords {
     this._challengePending = undefined;
     // replies carry no correlation id, so same-cmd requests collide. serialize everything
     this._lock = Promise.resolve();
+    // per cmd: requests we stopped waiting for whose reply may still arrive
+    this._abandoned = new Map();
   }
 
-  _withLock(fn) {
-    const run = this._lock.then(fn, fn);
+  // waitMs bounds only the wait for our turn; once fn runs, its own timeout applies
+  _withLock(fn, waitMs) {
+    let started = false;
+    let gaveUp = false;
+    let timer;
+    const go = () => {
+      if (gaveUp) throw new Error("skipped: caller stopped waiting");
+      started = true;
+      clearTimeout(timer);
+      return fn();
+    };
+    const run = this._lock.then(go, go);
     this._lock = run.then(
       () => {},
       () => {},
     );
-    return run;
+    if (waitMs == null) return run;
+    const waited = new Promise((_, reject) => {
+      timer = setTimeout(() => {
+        if (started) return;
+        gaveUp = true;
+        this._logEvent("lock.busy", "warn", { waitMs, inFlight: [...this._waiters.keys()].map(cmdName) });
+        const e = new Error("Passwords helper is busy with another request");
+        e.code = "busy";
+        reject(e);
+      }, waitMs);
+    });
+    return Promise.race([run, waited]);
+  }
+
+  // a closed port never answers: settle everyone still waiting so the lock frees up
+  _failWaiters(why) {
+    for (const w of this._waiters.values()) {
+      if (w.timer) clearTimeout(w.timer);
+      w.reject(new Error(why));
+    }
+    this._waiters.clear();
+    this._abandoned.clear();
+  }
+
+  _abandon(cmd) {
+    this._abandoned.set(cmd, (this._abandoned.get(cmd) ?? 0) + 1);
+  }
+
+  // stop waiting on requests older than minAgeMs so the lock frees up. their reply, if it
+  // ever comes, is either logged as late or flagged as possibly stale for the next waiter
+  abortStale(minAgeMs, why) {
+    const now = Date.now();
+    let n = 0;
+    for (const [cmd, w] of [...this._waiters]) {
+      if (now - w.started < minAgeMs) continue;
+      this._waiters.delete(cmd);
+      if (w.timer) clearTimeout(w.timer);
+      this._abandon(cmd);
+      n += 1;
+      w.reject(new Error(`cancelled: ${why}`));
+    }
+    if (n) this._logEvent("native.abort", "warn", { n, why });
+    return n;
   }
 
   _logEvent(t, lvl, d) {
@@ -197,12 +261,14 @@ export class ApplePasswords {
           reject(e);
         },
         timer: null,
+        started,
       };
       entry.timer =
         timeoutMs == null
           ? null
           : setTimeout(() => {
               if (this._waiters.get(cmd) === entry) this._waiters.delete(cmd);
+              this._abandon(cmd);
               this._logEvent("native.done", "warn", { cmd: name, dur: Date.now() - started, outcome: "timeout", ...meta });
               reject(new Error("timeout waiting for response"));
             }, timeoutMs);
@@ -220,10 +286,23 @@ export class ApplePasswords {
 
   _dispatch(message) {
     const w = this._waiters.get(message.cmd);
+    // no correlation id: after an abandoned request, the next reply on that cmd may be its answer
+    const abandoned = this._abandoned.get(message.cmd) ?? 0;
+    if (abandoned) {
+      if (abandoned > 1) this._abandoned.set(message.cmd, abandoned - 1);
+      else this._abandoned.delete(message.cmd);
+    }
     if (w) {
       this._waiters.delete(message.cmd);
       if (w.timer) clearTimeout(w.timer);
-      w.resolve(message);
+      if (abandoned && SECRET_CMDS.has(message.cmd)) {
+        this._logEvent("native.stale-reply", "warn", { cmd: cmdName(message.cmd), abandoned });
+        const e = new Error("Got a reply that may belong to an earlier request, try again");
+        e.code = "stale_reply";
+        w.reject(e);
+      } else {
+        w.resolve(message);
+      }
     } else if (
       message.cmd === Command.ONE_TIME_CODE_AVAILABLE ||
       message.cmd === Command.PASSWORDS_DISABLED ||
@@ -273,7 +352,7 @@ export class ApplePasswords {
         this._logEvent("disconnect", "warn", { lastError: err ? String(err) : "(none)" });
         this.port = undefined;
         this.session = undefined;
-        this._waiters.clear();
+        this._failWaiters("helper disconnected");
         if (err && /not found|forbidden|host/i.test(err)) this._setState(State.NoHelper, `native host error: ${err}`);
         else this._setState(State.Disconnected, "port disconnected");
       });
@@ -474,7 +553,7 @@ export class ApplePasswords {
         return (res.Entries ?? []).map((e) => ({ username: e.USR, sites: e.sites }));
       if (res.STATUS === QueryStatus.NoResults) return [];
       throw queryStatusError(res.STATUS);
-    });
+    }, LOCK_WAIT_MS);
   }
 
   async getPasswordForLoginName(tabId, url, loginName) {
@@ -487,7 +566,7 @@ export class ApplePasswords {
         // query by frame hostname, never loginName.sites which a page could point at another origin
         hostname,
         { ACT: Action.SEARCH, URL: hostname, USR: loginName.username },
-        null, // no timeout, helper may require Touch ID here
+        AUTH_TIMEOUT_MS, // long: the helper may wait on Touch ID here
       );
       if (res.STATUS === QueryStatus.Success) {
         const e = (res.Entries ?? [])[0];
@@ -566,16 +645,16 @@ export class ApplePasswords {
       if (res.STATUS === QueryStatus.Success) return { entries: normalizeOtpEntries(res.Entries), requiresAuth };
       if (res.STATUS === QueryStatus.NoResults) return { entries: [], requiresAuth };
       throw queryStatusError(res.STATUS);
-    });
+    }, LOCK_WAIT_MS);
   }
 
-  // read at pick time so a code listed earlier isnt filled after it rotated. no timeout, may need Touch ID
+  // read at pick time so a code listed earlier isnt filled after it rotated. long timeout, may need Touch ID
   async readOneTimeCode(tabId, frameId, frameUrls, username) {
     if (!this.ready) throw new Error("not unlocked");
     const body = { ACT: Action.SEARCH, TYPE: "oneTimeCodes", frameURLs: frameUrls };
     if (username) body.username = username;
     return this._withLock(async () => {
-      const res = await this._encryptedQuery(Command.DID_FILL_ONE_TIME_CODE, tabId, null, body, null, frameId);
+      const res = await this._encryptedQuery(Command.DID_FILL_ONE_TIME_CODE, tabId, null, body, AUTH_TIMEOUT_MS, frameId);
       this._logEvent("query", res.STATUS === QueryStatus.Success ? "debug" : "warn", {
         cmd: QueryId[Command.DID_FILL_ONE_TIME_CODE],
         status: res.STATUS,
@@ -624,6 +703,7 @@ export class ApplePasswords {
     } catch (_) {}
     this.port = undefined;
     this.session = undefined;
+    this._failWaiters("disconnected");
     this._setState(State.Disconnected, "user disconnected");
   }
 }
