@@ -319,7 +319,10 @@ function fillErrorText(res) {
   }
   if (/origin mismatch/i.test(err)) return "Not filled: the page address changed while filling.";
   if (/not unlocked|not connected|locked/i.test(err)) return "Not filled: the vault is locked.";
-  if (/timeout|did not answer|no response/i.test(err)) return "Not filled: Apple's helper did not answer.";
+  if (/timeout|did not answer|no response/i.test(err))
+    return "Not filled: macOS got no confirmation in time. Try again and confirm the Touch ID or password prompt.";
+  if (/busy/i.test(err)) return "Not filled: still waiting on an earlier macOS prompt. Confirm or cancel it first.";
+  if (/stale_reply|earlier request/i.test(err)) return "Not filled: got an outdated answer from the helper. Try again.";
   if (reason === "no-credential") return "Not filled: no saved password for this account on this site.";
   if (reason === "no-field" || reason === "partial") return "Not filled: this page has no password field I can safely target.";
   return err ? `Not filled: ${err}` : "Not filled.";
@@ -352,7 +355,10 @@ async function renderLogins() {
     fill.textContent = "Fill";
     fill.addEventListener("click", async () => {
       fill.disabled = true;
+      // reading the password can make macOS ask for Touch ID, say so instead of looking stuck
+      const hint = setTimeout(() => showNote("Waiting for macOS: confirm with Touch ID or your Mac password."), 800);
       const r = await send({ type: "fillOnPage", tabId: tab.id, url: tab.url, loginName: login });
+      clearTimeout(hint);
       if (r?.ok && r.filled) window.close();
       else {
         fill.disabled = false;
@@ -473,6 +479,12 @@ pinInput.addEventListener("input", () => {
 });
 
 let noteTimer = null;
+function showNote(text) {
+  const el = document.getElementById("refresh-note");
+  el.textContent = text;
+  el.hidden = false;
+  clearTimeout(noteTimer);
+}
 function flashNote(text) {
   const el = document.getElementById("refresh-note");
   el.textContent = text;

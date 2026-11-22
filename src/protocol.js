@@ -115,14 +115,16 @@ export class ApplePasswords {
     this._challengeAt = 0;
     this._challengeGen = 0;
     this._challengePending = undefined;
-    // replies carry no correlation id, so same-cmd requests collide. serialize everything
-    this._lock = Promise.resolve();
+    // replies carry no correlation id, so same-cmd requests collide. one queue per cmd
+    // (handshakes share "global"): a password read waiting on Touch ID must not hold
+    // up the login-name lookups that draw the dropdown, they answer on another cmd
+    this._locks = new Map();
     // per cmd: requests we stopped waiting for whose reply may still arrive
     this._abandoned = new Map();
   }
 
   // waitMs bounds only the wait for our turn; once fn runs, its own timeout applies
-  _withLock(fn, waitMs) {
+  _withLock(fn, waitMs, key = "global") {
     let started = false;
     let gaveUp = false;
     let timer;
@@ -132,11 +134,15 @@ export class ApplePasswords {
       clearTimeout(timer);
       return fn();
     };
-    const run = this._lock.then(go, go);
-    this._lock = run.then(
+    const run = (this._locks.get(key) ?? Promise.resolve()).then(go, go);
+    const tail = run.then(
       () => {},
       () => {},
     );
+    this._locks.set(key, tail);
+    tail.then(() => {
+      if (this._locks.get(key) === tail) this._locks.delete(key);
+    });
     if (waitMs == null) return run;
     const waited = new Promise((_, reject) => {
       timer = setTimeout(() => {
@@ -553,7 +559,7 @@ export class ApplePasswords {
         return (res.Entries ?? []).map((e) => ({ username: e.USR, sites: e.sites }));
       if (res.STATUS === QueryStatus.NoResults) return [];
       throw queryStatusError(res.STATUS);
-    }, LOCK_WAIT_MS);
+    }, LOCK_WAIT_MS, Command.GET_LOGIN_NAMES_FOR_URL);
   }
 
   async getPasswordForLoginName(tabId, url, loginName) {
@@ -584,7 +590,7 @@ export class ApplePasswords {
       this._logQuery(Command.GET_PASSWORD_FOR_LOGIN_NAME, hostname, res, { requested: maskUser(loginName.username) });
       if (res.STATUS === QueryStatus.NoResults) return undefined;
       throw queryStatusError(res.STATUS);
-    });
+    }, null, Command.GET_PASSWORD_FOR_LOGIN_NAME);
   }
 
   // ACT maybeAdd lets the helper decide add-vs-update and drive the native save prompt
@@ -622,7 +628,7 @@ export class ApplePasswords {
         if (!/timeout/i.test(String(e?.message ?? e))) throw e;
       }
       return true;
-    });
+    }, null, Command.SET_PASSWORD_FOR_LOGIN_NAME_URL);
   }
 
   async getOneTimeCodes(tabId, frameId, frameUrls, username) {
@@ -645,7 +651,7 @@ export class ApplePasswords {
       if (res.STATUS === QueryStatus.Success) return { entries: normalizeOtpEntries(res.Entries), requiresAuth };
       if (res.STATUS === QueryStatus.NoResults) return { entries: [], requiresAuth };
       throw queryStatusError(res.STATUS);
-    }, LOCK_WAIT_MS);
+    }, LOCK_WAIT_MS, Command.GET_ONE_TIME_CODES);
   }
 
   // read at pick time so a code listed earlier isnt filled after it rotated. long timeout, may need Touch ID
@@ -666,7 +672,7 @@ export class ApplePasswords {
       if (res.STATUS === QueryStatus.Success) return normalizeOtpEntries(res.Entries);
       if (res.STATUS === QueryStatus.NoResults) return [];
       throw queryStatusError(res.STATUS);
-    });
+    }, null, Command.DID_FILL_ONE_TIME_CODE);
   }
 
   launchPasswordsApp({ searchUrl, newPasswordUrl, totpUri, totpPageUrl } = {}) {

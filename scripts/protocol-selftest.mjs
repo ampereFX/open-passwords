@@ -41,6 +41,18 @@ const NAMES = Command.GET_LOGIN_NAMES_FOR_URL;
   check("busy: skipped fn did not run", !ran);
 }
 
+// a password read waiting on Touch ID does not hold up the login-name lookup
+{
+  const { c } = client();
+  const hung = c._withLock(() => c._send(PW, {}, null), null, PW);
+  const r = await settle(c._withLock(async () => "names", 30, NAMES));
+  check("per-cmd lock: lookup runs past a pending password read", r.ok && r.v === "names", r.e?.message);
+  const same = await settle(c._withLock(async () => "pw2", 30, PW));
+  check("per-cmd lock: same cmd still queues", !same.ok && same.e.code === "busy");
+  c.abortStale(0, "cleanup");
+  await settle(hung);
+}
+
 // a lookup that gets its turn in time is not cut off by the wait bound
 {
   const { c } = client();

@@ -4,7 +4,7 @@
 // A classic content script cannot import log.js, so this is a thin producer: it posts
 // events to the worker, which owns the buffer and applies the redaction whitelist.
 // Never put a field value in here, only shape, counts and decisions.
-const OP_BUILD = "0.53.0";
+const OP_BUILD = "0.54.0";
 let opTraceSeq = 0;
 let opTrace = "boot";
 let opQueue = [];
@@ -582,7 +582,19 @@ function hideFillError() {
   fillErrorEl = null;
 }
 
-function showFillError(field, text) {
+// shown while macOS waits on Touch ID or the Mac password; without it a pending read
+// looks like the extension silently ignored the click
+const AUTH_HINT_DELAY_MS = 800;
+const AUTH_HINT_TEXT = "Waiting for macOS: confirm with Touch ID or your Mac password.";
+function fillWithAuthHint(field, promise) {
+  const t = setTimeout(() => showFillError(field, AUTH_HINT_TEXT, { tone: "info", sticky: true }), AUTH_HINT_DELAY_MS);
+  return promise.finally(() => {
+    clearTimeout(t);
+    if (fillErrorEl?.textContent === AUTH_HINT_TEXT) hideFillError();
+  });
+}
+
+function showFillError(field, text, { tone = "error", sticky = false } = {}) {
   if (!text) return;
   hideFillError();
   ensureFontFace();
@@ -599,9 +611,11 @@ function showFillError(field, text) {
     fontSize: "12px",
     lineHeight: "1.35",
   });
-  el.style.setProperty("background", "light-dark(rgba(255,246,245,0.95), rgba(48,28,28,0.92))");
-  el.style.setProperty("color", "light-dark(#B3261E, #FFB4AB)");
-  el.style.setProperty("border-color", "light-dark(rgba(179,38,30,0.30), rgba(255,180,171,0.35))");
+  if (tone === "error") {
+    el.style.setProperty("background", "light-dark(rgba(255,246,245,0.95), rgba(48,28,28,0.92))");
+    el.style.setProperty("color", "light-dark(#B3261E, #FFB4AB)");
+    el.style.setProperty("border-color", "light-dark(rgba(179,38,30,0.30), rgba(255,180,171,0.35))");
+  }
   el.addEventListener("click", hideFillError);
   el.addEventListener("mousedown", (e) => e.stopPropagation());
   (document.body || document.documentElement).appendChild(el);
@@ -616,8 +630,9 @@ function showFillError(field, text) {
     el.style.top = `${window.scrollY + 24}px`;
   }
   fillErrorEl = el;
-  fillErrorTimer = setTimeout(hideFillError, 7000);
-  opLog("fill.error-shown", "info", { text });
+  // the auth hint stays until the read settles, a prompt can take a while
+  fillErrorTimer = setTimeout(hideFillError, sticky ? 95_000 : 7000);
+  opLog(tone === "error" ? "fill.error-shown" : "fill.hint-shown", "info", { text });
 }
 
 // turn a machine-readable reason (plus the background's error) into one sentence
@@ -629,7 +644,10 @@ function fillErrorText(res, fallback) {
   }
   if (/origin mismatch/i.test(err)) return "Not filled: the page address changed while filling.";
   if (/not unlocked|not connected|locked/i.test(err)) return "Not filled: the vault is locked. Unlock it first.";
-  if (/timeout|did not answer|no response/i.test(err)) return "Not filled: Apple's helper did not answer. Try again.";
+  if (/timeout|did not answer|no response/i.test(err))
+    return "Not filled: macOS got no confirmation in time. Try again and confirm the Touch ID or password prompt.";
+  if (reason === "busy" || /busy/i.test(err)) return "Not filled: still waiting on an earlier macOS prompt. Confirm or cancel it, then try again.";
+  if (/stale_reply|earlier request/i.test(err)) return "Not filled: got an outdated answer from the helper. Try again.";
   if (reason === "no-credential") return "Not filled: no saved password for this account on this site.";
   if (reason === "no-field" || reason === "partial") return "Not filled: this page has no password field I can safely target.";
   return err ? `Not filled: ${err}` : fallback || "Not filled.";
@@ -756,8 +774,7 @@ async function buildLockedSuggestion(field, onUnlock) {
     if (cachedLogins.length === 1) {
       removeSuggestion();
       fillAnchor = field;
-      chrome.runtime
-        .sendMessage({ type: "inlineFill", loginName: cachedLogins[0], trace: opTrace })
+      fillWithAuthHint(field, chrome.runtime.sendMessage({ type: "inlineFill", loginName: cachedLogins[0], trace: opTrace }))
         .then((r) => {
           opLog("unlock.autofill", r?.filled ? "info" : "warn", { ok: r?.ok, filled: r?.filled, error: r?.error, reason: r?.reason });
           if (!r?.filled) showFillError(liveField(field), fillErrorText(r, "Not filled: the password did not go in."));
@@ -924,8 +941,7 @@ function appendLoginRows(box, field, logins) {
       opLog("pick.login", "info", { user: opMask(login.username) || "(none)", userLen: String(login.username || "").length, anchor: fieldInfo(field) }, { trace });
       removeSuggestion();
       fillAnchor = field;
-      chrome.runtime
-        .sendMessage({ type: "inlineFill", loginName: login, trace })
+      fillWithAuthHint(liveField(field), chrome.runtime.sendMessage({ type: "inlineFill", loginName: login, trace }))
         .then((r) => {
           // the dropdown is already gone by now, so this reply is the only feedback there is
           opLog(

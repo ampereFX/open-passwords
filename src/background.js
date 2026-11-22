@@ -287,6 +287,21 @@ function uniqueByUsername(logins) {
 
 const lastFillByTab = new Map();
 
+// a second Fill click while macOS is still asking for Touch ID would queue a second
+// prompt behind the first; share the read that is already waiting instead
+const pwReadsInFlight = new Map();
+function readPassword(tabId, url, host, loginName) {
+  const k = pwCacheKey(host, loginName?.username);
+  const running = pwReadsInFlight.get(k);
+  if (running) {
+    logUp("pw.read.shared", "debug", { host, user: maskUser(loginName?.username) });
+    return running;
+  }
+  const p = client.getPasswordForLoginName(tabId, url, loginName).finally(() => pwReadsInFlight.delete(k));
+  pwReadsInFlight.set(k, p);
+  return p;
+}
+
 // re-filling the same login skips a second Touch ID, apple prompts every read
 const PW_CACHE_TTL_MS = 120_000;
 const pwCache = new Map();
@@ -617,7 +632,7 @@ chrome.runtime.onMessage.addListener((msg, sender, rawRespond) => {
           let cred = pwCacheGet(host, safeLogin.username);
           const cacheHit = !!cred;
           if (!cred) {
-            cred = await client.getPasswordForLoginName(sender.tab.id, frameUrl, safeLogin);
+            cred = await readPassword(sender.tab.id, frameUrl, host, safeLogin);
             if (cred) pwCacheSet(host, cred);
           }
           logUp(
@@ -894,7 +909,7 @@ chrome.runtime.onMessage.addListener((msg, sender, rawRespond) => {
           let cred = pwCacheGet(host, msg.loginName?.username);
           const cacheHit = !!cred;
           if (!cred) {
-            cred = await client.getPasswordForLoginName(tab.id, tab.url, msg.loginName);
+            cred = await readPassword(tab.id, tab.url, host, msg.loginName);
             if (cred) pwCacheSet(host, cred);
           }
           logUp(
@@ -961,7 +976,7 @@ chrome.runtime.onMessage.addListener((msg, sender, rawRespond) => {
             return sendResponse({ ok: true, refilled: false });
           }
           try {
-            const cred = await client.getPasswordForLoginName(tab.id, tab.url, { username: entry.username });
+            const cred = await readPassword(tab.id, tab.url, host, { username: entry.username });
             if (!cred) {
               logUp("popup.refill.missing", "warn", { host, user: maskUser(entry.username) }, { trace, ctx });
               return sendResponse({ ok: true, refilled: false });
