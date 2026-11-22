@@ -345,8 +345,9 @@ chrome.alarms.onAlarm.addListener((a) => {
   chrome.runtime.getPlatformInfo(() => void chrome.runtime.lastError);
 });
 
-async function ensureConnected() {
-  if (client.state === State.Disconnected) {
+// retry: the user asked to try again, so a helper that was missing earlier gets another go
+async function ensureConnected({ retry = false } = {}) {
+  if (client.state === State.Disconnected || (retry && client.state === State.NoHelper && !client.port)) {
     logUp("connect.ensure", "debug", { state: client.state });
     try {
       await client.connect();
@@ -836,7 +837,7 @@ chrome.runtime.onMessage.addListener((msg, sender, rawRespond) => {
 
         case "connect":
           logUp("connect.request", "info", { state: client.state, portOpen: client.port !== undefined }, { trace, ctx });
-          await ensureConnected();
+          await ensureConnected({ retry: true });
           sendResponse({ ok: true, state: client.state, stateReason: client.stateReason });
           break;
 

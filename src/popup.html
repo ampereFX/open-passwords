@@ -21,6 +21,7 @@
           Couldn't reach Apple's password helper. This needs macOS 14+ with the
           Passwords app, and the extension must run with Apple's accepted ID.
         </p>
+        <button class="retry-connect">Try again</button>
       </section>
 
       <!-- Needs PIN -->
@@ -37,6 +38,8 @@
       <!-- Connecting -->
       <section id="view-connecting" hidden>
         <p class="msg">Connecting to Apple Passwords…</p>
+        <p id="connect-slow" class="msg subnote" hidden>This is taking long. Apple's helper may still be starting.</p>
+        <button id="connect-retry" class="retry-connect" hidden>Try again</button>
       </section>
 
       <!-- Unlocked: logins for current site -->

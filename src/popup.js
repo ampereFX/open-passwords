@@ -293,7 +293,7 @@ async function render(state) {
   setDot(state);
   refreshBtn.hidden = state !== "unlocked" && state !== "needs_pin";
   if (state === "no_helper") return show("nohelper");
-  if (state === "disconnected") return show("connecting");
+  if (state === "disconnected") return showConnecting();
   if (state === "needs_pin") {
     show("pin");
     pinInput.focus();
@@ -307,7 +307,35 @@ async function render(state) {
     return;
   }
   // unknown state must never leave every view hidden (blank popup)
+  showConnecting();
+}
+
+// "Connecting…" used to be a dead end when the helper never answered its hello
+let connectSlowTimer = null;
+function showConnecting() {
   show("connecting");
+  document.getElementById("connect-slow").hidden = true;
+  document.getElementById("connect-retry").hidden = true;
+  clearTimeout(connectSlowTimer);
+  connectSlowTimer = setTimeout(() => {
+    if (lastState !== "disconnected" && lastState !== "connecting") return;
+    document.getElementById("connect-slow").hidden = false;
+    document.getElementById("connect-retry").hidden = false;
+  }, 6000);
+}
+
+for (const btn of document.querySelectorAll(".retry-connect")) {
+  btn.addEventListener("click", async () => {
+    btn.disabled = true;
+    const r = await send({ type: "connect" });
+    btn.disabled = false;
+    let state = r?.state ?? "disconnected";
+    if (state === "needs_pin") {
+      const ch = await send({ type: "requestChallenge", ifNeeded: true });
+      state = ch?.state ?? state;
+    }
+    render(state);
+  });
 }
 
 // one sentence the user can act on, instead of a button that does nothing
@@ -455,11 +483,15 @@ document.getElementById("setup-totp").addEventListener("click", async () => {
   window.close();
 });
 
+// the sixth digit submits on its own, so a following Enter must not send the code twice
+let verifying = false;
 document.getElementById("verify").addEventListener("click", async () => {
+  if (verifying) return;
   pinError.hidden = true;
   const pin = pinInput.value.trim();
   if (pin.length < 4) return;
-  const res = await send({ type: "verifyPin", pin });
+  verifying = true;
+  const res = await send({ type: "verifyPin", pin }).finally(() => (verifying = false));
   if (res?.ok) render(res.state);
   else {
     // a failed attempt spends the code, so the background put a fresh one on the Mac

@@ -157,6 +157,24 @@ export class ApplePasswords {
     return Promise.race([run, waited]);
   }
 
+  _newSession(why) {
+    this.session = new SRPSession(this.capabilities?.shouldUseBase64);
+    this._challengeAt = 0;
+    this._logEvent("session.new", "info", { why });
+  }
+
+  // a port that never finished its hello is useless: close it so the next connect() opens
+  // a new one instead of early-returning on it forever
+  _abandonPort(why) {
+    const port = this.port;
+    this.port = undefined;
+    this.session = undefined;
+    this._failWaiters(why);
+    try {
+      port?.disconnect();
+    } catch (_) {}
+  }
+
   // a closed port never answers: settle everyone still waiting so the lock frees up
   _failWaiters(why) {
     for (const w of this._waiters.values()) {
@@ -322,9 +340,12 @@ export class ApplePasswords {
       this._logEvent("native.late-reply", "warn", { cmd: cmdName(message.cmd), why: "no waiter (arrived after timeout?)" });
     }
     if (message.cmd === Command.PASSWORDS_DISABLED || message.cmd === Command.RELOGIN_NEEDED) {
-      this._logEvent("native.session-lost", "warn", { cmd: cmdName(message.cmd) });
-      this.session = undefined;
-      // the port stays open, so a plain reconnect has to re-issue a handshake
+      this._logEvent("native.session-lost", "warn", { cmd: cmdName(message.cmd), inFlight: this._waiters.size });
+      // the old session's queries will never decrypt, settle them instead of waiting 90s
+      this._failWaiters("the helper ended the session, unlock again");
+      // the port stays open, so the next challenge has to start a fresh SRP session;
+      // leaving it undefined made requestChallenge refuse forever ("not connected")
+      this._newSession(`helper sent ${cmdName(message.cmd)}`);
       this._setState(State.NeedsPin, `helper sent ${cmdName(message.cmd)}`);
     }
     if (message.cmd === Command.ONE_TIME_CODE_AVAILABLE && !w) {
@@ -352,9 +373,13 @@ export class ApplePasswords {
       }
       this.port = port;
 
-      port.onMessage.addListener((msg) => this._dispatch(msg));
+      port.onMessage.addListener((msg) => {
+        if (this.port === port) this._dispatch(msg);
+      });
       port.onDisconnect.addListener(() => {
         const err = chrome.runtime.lastError?.message;
+        // a port we already gave up on must not reset the state of its successor
+        if (this.port !== port) return;
         this._logEvent("disconnect", "warn", { lastError: err ? String(err) : "(none)" });
         this.port = undefined;
         this.session = undefined;
@@ -383,8 +408,9 @@ export class ApplePasswords {
               stage: "capabilities",
               secretSessionVersion: this.capabilities.secretSessionVersion,
               expected: SecretSessionVersion.SRPWithRFCVerification,
-              note: "port stays open, retry then early-returns",
             });
+            this._abandonPort("unsupported capabilities");
+            this._setState(State.NoHelper, "helper wants an unsupported pairing protocol");
             return reject(new Error("unsupported capabilities (expected SRP RFC verification)"));
           }
           this.session = new SRPSession(this.capabilities.shouldUseBase64);
@@ -393,6 +419,11 @@ export class ApplePasswords {
         })
         .catch((e) => {
           this._logEvent("connect.failed", "error", { stage: "capabilities", err: errInfo(e) });
+          // the next ensureConnected() must really reconnect, not find this dead port
+          if (this.port === port) {
+            this._abandonPort("no capabilities");
+            this._setState(State.Disconnected, "helper did not answer the hello");
+          }
           reject(e);
         });
     });
@@ -411,8 +442,11 @@ export class ApplePasswords {
 
   // ifNeeded keeps a live prompt, a second code on screen invalidates the one the user is reading
   requestChallenge({ ifNeeded = false } = {}) {
+    // the helper dropped our session (RELOGIN_NEEDED) but the port is still open: pair anew
+    if (!this.session && this.port && this.capabilities) this._newSession("challenge without a session");
     if (!this.session) return Promise.reject(new Error("not connected"));
-    if (ifNeeded && (this.hasChallenge || this.state === State.Unlocked)) return Promise.resolve(false);
+    // ready, not just state: an "unlocked" state without a shared key must still get a code
+    if (ifNeeded && (this.hasChallenge || this.ready)) return Promise.resolve(false);
     // two prompts would race and only the last code works
     if (this._challengePending) return this._challengePending;
     const p = this._withLock(() => this._issueChallenge());
@@ -463,6 +497,12 @@ export class ApplePasswords {
   // a PIN only matches the challenge it was shown for, so re-issue and ask for the new code
   async verifyPin(pin) {
     if (!this.session) throw new Error("not connected");
+    // auto-pair and a typed code (or Enter after the sixth digit) race for the same
+    // challenge; the loser must not re-lock a vault the winner just opened
+    if (this.ready) {
+      this._logEvent("verify", "debug", { skipped: "already unlocked", pinLen: String(pin || "").length });
+      return;
+    }
     if (!this.hasChallenge) {
       this._logEvent("verify", "warn", { why: "no live challenge", pinLen: String(pin || "").length });
       await this.requestChallenge();
@@ -471,6 +511,12 @@ export class ApplePasswords {
     const gen = this._challengeGen;
     this._logEvent("verify", "info", { gen, pinLen: String(pin || "").length });
     return this._withLock(async () => {
+      // a verify queued behind the one that unlocked: sending m2 again would fail and
+      // the catch below would wipe the shared key of the session that just opened
+      if (this.ready) {
+        this._logEvent("verify", "debug", { skipped: "unlocked while queued", gen });
+        return;
+      }
       // re-issued while queued, typed code is for the old prompt
       if (gen !== this._challengeGen) throw challengeError("Enter the new code your Mac is showing now");
       // declared outside the try so the catch can report the helper's ErrCode

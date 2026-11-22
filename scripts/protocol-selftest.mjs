@@ -2,7 +2,7 @@
 // A reply that never comes must not stall every later request, and a reply that may
 // belong to an abandoned request must never be handed out as a password. Run: npm test
 
-import { ApplePasswords, Command } from "../src/protocol.js";
+import { ApplePasswords, Command, State } from "../src/protocol.js";
 
 let failed = 0;
 let passed = 0;
@@ -140,6 +140,113 @@ const NAMES = Command.GET_LOGIN_NAMES_FOR_URL;
   check("disconnect: waiter rejects", !(await hung).ok);
   const r = await next;
   check("disconnect: queued request runs", r.ok && r.v === "next", r.e?.message);
+}
+
+// --- stuck states: each block below was a reproduced dead end before 0.55 ---
+
+const b64 = (o) => Buffer.from(JSON.stringify(o)).toString("base64");
+function fakeSession() {
+  return {
+    username: "u",
+    serverPublicKey: 1n,
+    salt: new Uint8Array([1]),
+    sharedKey: undefined,
+    async setSharedKey() {
+      await sleep(30);
+      this.sharedKey = 7n;
+    },
+    async computeM() {
+      return new Uint8Array([1]);
+    },
+    async computeHMAC() {
+      return new Uint8Array([2]);
+    },
+    deserialize: () => new Uint8Array([2]),
+    serialize: () => "x",
+  };
+}
+
+// auto-pair and a typed code verify the same challenge at once: the second must not
+// wipe the key of the session the first one opened, nor re-lock it
+{
+  const c = new ApplePasswords();
+  let m2 = 0;
+  c.port = {
+    postMessage: (m) => {
+      if (m.cmd !== Command.HANDSHAKE) return;
+      m2 += 1;
+      const ok = m2 === 1;
+      setTimeout(
+        () => c._dispatch({ cmd: Command.HANDSHAKE, payload: { PAKE: b64({ TID: "u", MSG: 3, ErrCode: ok ? 0 : 1, HAMK: "x" }) } }),
+        5,
+      );
+    },
+  };
+  c.session = fakeSession();
+  c.state = State.NeedsPin;
+  c._challengeAt = Date.now();
+  const r = await Promise.allSettled([c.verifyPin("111111"), c.verifyPin("111111")]);
+  check("double verify: both settle ok", r.every((x) => x.status === "fulfilled"), r.map((x) => x.reason?.message));
+  check("double verify: still ready", c.ready && c.state === State.Unlocked, { state: c.state, ready: c.ready });
+  check("double verify: m2 sent once", m2 === 1, m2);
+  await c.verifyPin("222222");
+  check("verify after unlock: no re-lock", c.ready && m2 === 1, { state: c.state, m2 });
+}
+
+// "unlocked" without a shared key must still be able to ask for a code
+{
+  const c = new ApplePasswords();
+  const sent = [];
+  c.port = { postMessage: (m) => sent.push(m) };
+  c.capabilities = {};
+  c.session = fakeSession();
+  c.state = State.Unlocked;
+  c.requestChallenge({ ifNeeded: true });
+  await sleep(5);
+  check("zombie unlocked: challenge issued", sent.some((m) => m.cmd === Command.HANDSHAKE), sent.length);
+  c.abortStale(0, "cleanup");
+}
+
+// the helper ends the session (sleep, lock): unlocking again must work on the same port
+{
+  const c = new ApplePasswords();
+  const sent = [];
+  c.port = { postMessage: (m) => sent.push(m) };
+  c.capabilities = {};
+  c.session = fakeSession();
+  c.state = State.Unlocked;
+  const pending = settle(c._send(PW, {}, null));
+  c._dispatch({ cmd: Command.RELOGIN_NEEDED });
+  check("relogin: in-flight query settles", !(await pending).ok);
+  check("relogin: fresh session", !!c.session && c.state === State.NeedsPin, { state: c.state });
+  const ch = settle(c.requestChallenge());
+  await sleep(5);
+  check("relogin: challenge goes out", sent.some((m) => m.cmd === Command.HANDSHAKE));
+  c.abortStale(0, "cleanup");
+  await ch;
+}
+
+// the helper never answers the hello: the next connect must open a new port
+{
+  let opened = 0;
+  globalThis.chrome = {
+    runtime: {
+      lastError: null,
+      connectNative: () => {
+        opened += 1;
+        return { postMessage() {}, disconnect() {}, onMessage: { addListener() {} }, onDisconnect: { addListener() {} } };
+      },
+    },
+  };
+  const c = new ApplePasswords();
+  const orig = c._send.bind(c);
+  c._send = (cmd, body, t) => orig(cmd, body, cmd === Command.GET_CAPABILITIES ? 20 : t);
+  const first = await settle(c.connect());
+  check("hello timeout: rejects", !first.ok);
+  check("hello timeout: port dropped", c.port === undefined && c.state === State.Disconnected, { state: c.state });
+  await settle(c.connect());
+  check("hello timeout: retry opens a new port", opened === 2, opened);
+  delete globalThis.chrome;
 }
 
 console.log(`protocol self-test: ${passed} passed, ${failed} failed`);
