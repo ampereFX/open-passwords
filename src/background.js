@@ -382,9 +382,15 @@ chrome.alarms.onAlarm.addListener((a) => {
   chrome.runtime.getPlatformInfo(() => void chrome.runtime.lastError);
 });
 
-// retry: the user asked to try again, so a helper that was missing earlier gets another go
+// a helper missing at browser start (installed later, or slow to register) used to stay
+// "missing" until a restart. retry: the user asked; otherwise at most every 30s
+const NO_HELPER_RETRY_MS = 30_000;
+let lastNoHelperTry = 0;
 async function ensureConnected({ retry = false } = {}) {
-  if (client.state === State.Disconnected || (retry && client.state === State.NoHelper && !client.port)) {
+  const retryNoHelper =
+    client.state === State.NoHelper && !client.port && (retry || Date.now() - lastNoHelperTry > NO_HELPER_RETRY_MS);
+  if (retryNoHelper) lastNoHelperTry = Date.now();
+  if (client.state === State.Disconnected || retryNoHelper) {
     logUp("connect.ensure", "debug", { state: client.state });
     try {
       await client.connect();
@@ -452,9 +458,11 @@ chrome.runtime.onInstalled.addListener(suppressChromeAutofill);
 chrome.runtime.onStartup.addListener(suppressChromeAutofill);
 suppressChromeAutofill();
 
-// content messages carry sender.tab, the popup never does
+// the popup has no sender.tab; the PIN iframe has one but runs from our own origin.
+// content scripts always report the page's http(s) URL, so they never pass this
 function isFromOwnUi(sender) {
-  return sender.id === chrome.runtime.id && sender.tab === undefined;
+  if (sender.id !== chrome.runtime.id) return false;
+  return sender.tab === undefined || /^chrome-extension:\/\//i.test(sender.url || "");
 }
 
 async function activeTab() {
@@ -462,7 +470,9 @@ async function activeTab() {
   return tab;
 }
 
-function registrableHost(u) {
+// the exact hostname, deliberately not the registrable domain: a password cached or
+// MRU-ranked for login.example.com must not follow the user to www.example.com
+function hostOf(u) {
   try {
     return new URL(u).hostname.toLowerCase();
   } catch {
@@ -518,7 +528,7 @@ function summarizeResponse(res) {
 chrome.runtime.onMessage.addListener((msg, sender, rawRespond) => {
   const started = Date.now();
   const fromUi = isFromOwnUi(sender);
-  const fromContent = sender.id === chrome.runtime.id && sender.tab !== undefined;
+  const fromContent = !fromUi && sender.id === chrome.runtime.id && sender.tab !== undefined;
   const trace = msg?.trace ? String(msg.trace).slice(0, 40) : undefined;
   const ctx = {
     tab: sender.tab?.id,
@@ -594,7 +604,7 @@ chrome.runtime.onMessage.addListener((msg, sender, rawRespond) => {
           if (!client.ready) return sendResponse({ ok: true, locked: true, logins: [] });
           try {
             const logins = await client.getLoginNamesForURL(sender.tab?.id, frameUrl);
-            const ordered = uniqueByUsername(orderByMru(registrableHost(frameUrl), logins));
+            const ordered = uniqueByUsername(orderByMru(hostOf(frameUrl), logins));
             logUp(
               "fill.logins",
               "debug",
@@ -636,7 +646,7 @@ chrome.runtime.onMessage.addListener((msg, sender, rawRespond) => {
           const frameUrl = sender.url;
           const frameId = sender.frameId;
           if (!frameUrl || sender.tab?.id == null || frameId == null) return sendResponse({ ok: false, error: "no frame" });
-          const host = registrableHost(frameUrl);
+          const host = hostOf(frameUrl);
           if (schemeClass(frameUrl, host) === "http-public") {
             logUp("otp.refused", "warn", { host, why: "plain HTTP on a public host" }, { trace, ctx });
             return sendResponse({ ok: false, error: "refusing to fill on a non-HTTPS frame", reason: "insecure-origin" });
@@ -660,7 +670,7 @@ chrome.runtime.onMessage.addListener((msg, sender, rawRespond) => {
           if (!frameUrl || sender.tab?.id == null || frameId == null) {
             return sendResponse({ ok: false, error: "no frame" });
           }
-          const host = registrableHost(frameUrl);
+          const host = hostOf(frameUrl);
           const scheme = schemeClass(frameUrl, host);
           if (scheme === "http-public") {
             logUp("fill.refused", "warn", { host, scheme, why: "plain HTTP on a public host" }, { trace, ctx });
@@ -729,7 +739,7 @@ chrome.runtime.onMessage.addListener((msg, sender, rawRespond) => {
           if (!frameUrl || sender.tab?.id == null) {
             return sendResponse({ ok: false, error: "no frame" });
           }
-          const host = registrableHost(frameUrl);
+          const host = hostOf(frameUrl);
           if (schemeClass(frameUrl, host) === "http-public") {
             logUp("save.refused", "warn", { host, why: "plain HTTP on a public host" }, { trace, ctx });
             return sendResponse({ ok: false, error: "refusing to save from a non-HTTPS frame", reason: "insecure-origin" });
@@ -827,7 +837,7 @@ chrome.runtime.onMessage.addListener((msg, sender, rawRespond) => {
           // every frame gets it, only the one with a code field acts. value returned so the popup can show it if none did
           const tab = await activeTab();
           if (!tab?.url) return sendResponse({ ok: false, error: "no active tab" });
-          const host = registrableHost(tab.url);
+          const host = hostOf(tab.url);
           if (schemeClass(tab.url, host) === "http-public") {
             logUp("otp.refused", "warn", { host, why: "plain HTTP on a public host" }, { trace, ctx });
             return sendResponse({ ok: false, error: "refusing to fill on a non-HTTPS page", reason: "insecure-origin" });
@@ -893,6 +903,15 @@ chrome.runtime.onMessage.addListener((msg, sender, rawRespond) => {
           sendResponse({ ok: true, state: client.state, hasChallenge: client.hasChallenge });
           break;
 
+        case "pinFrameReady":
+        case "pinFrameClose": {
+          // only the content script that mounted the frame knows its nonce
+          if (sender.tab?.id == null) return sendResponse({ ok: false, error: "no tab" });
+          chrome.tabs.sendMessage(sender.tab.id, { type: msg.type, nonce: String(msg.nonce || "") }).catch(() => {});
+          sendResponse({ ok: true });
+          break;
+        }
+
         case "verifyPin": {
           if (fromContent && sender.frameId !== 0) {
             logUp("verify.forbidden", "warn", { why: "frameId !== 0", frame: sender.frameId }, { trace, ctx });
@@ -924,6 +943,10 @@ chrome.runtime.onMessage.addListener((msg, sender, rawRespond) => {
           logUp("verify.ok", "info", { state: client.state }, { trace, ctx });
           sendResponse({ ok: true, state: client.state });
           if (client.ready) flushPendingSaves();
+          // the PIN iframe cannot reach its content script: tell the tab like auto-pair does
+          if (client.ready && fromUi && sender.tab?.id != null) {
+            chrome.tabs.sendMessage(sender.tab.id, { type: "unlocked" }).catch(() => {});
+          }
           break;
         }
 
@@ -932,14 +955,14 @@ chrome.runtime.onMessage.addListener((msg, sender, rawRespond) => {
           if (!tab?.url) return sendResponse({ ok: false, error: "no active tab" });
           logUp("popup.logins", "debug", { tab: tab.id, url: safeUrl(tab.url), ready: client.ready });
           const logins = await client.getLoginNamesForURL(tab.id, tab.url);
-          sendResponse({ ok: true, logins: uniqueByUsername(orderByMru(registrableHost(tab.url), logins)) });
+          sendResponse({ ok: true, logins: uniqueByUsername(orderByMru(hostOf(tab.url), logins)) });
           break;
         }
 
         case "fillOnPage": {
           const tab = await activeTab();
           if (!tab?.url) return sendResponse({ ok: false, error: "no active tab" });
-          const host = registrableHost(tab.url);
+          const host = hostOf(tab.url);
           const scheme = schemeClass(tab.url, host);
           if (scheme === "http-public") {
             logUp("fill.refused", "warn", { host, scheme, why: "plain HTTP on a public host" }, { trace, ctx });
@@ -1004,7 +1027,7 @@ chrome.runtime.onMessage.addListener((msg, sender, rawRespond) => {
           if (aborted) logUp("popup.refresh.unstuck", "warn", { aborted }, { trace, ctx });
           const tab = await activeTab();
           const entry = tab?.id != null ? lastFillByTab.get(tab.id) : null;
-          const host = tab?.url ? registrableHost(tab.url) : null;
+          const host = tab?.url ? hostOf(tab.url) : null;
           const samePage = !!entry && entry.page === pageKey(tab?.url);
           if (!entry || !host || entry.host !== host || !samePage) {
             logUp("popup.refill.skip", "debug", {

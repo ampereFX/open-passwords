@@ -4,7 +4,7 @@
 // A classic content script cannot import log.js, so this is a thin producer: it posts
 // events to the worker, which owns the buffer and applies the redaction whitelist.
 // Never put a field value in here, only shape, counts and decisions.
-const OP_BUILD = "0.58.0";
+const OP_BUILD = "0.59.0";
 let opTraceSeq = 0;
 let opTrace = "boot";
 let opQueue = [];
@@ -351,6 +351,14 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
       onShortcut();
       return false;
     }
+    case "pinFrameReady": {
+      pinFrames.get(msg.nonce)?.ready();
+      return false;
+    }
+    case "pinFrameClose": {
+      pinFrames.get(msg.nonce)?.close();
+      return false;
+    }
     case "unlocked": {
       // auto-pair opened the vault while the inline PIN box was up
       opLog("unlock.push", "info", { hadBox: !!suggestionEl, resumable: typeof lockedResume === "function" });
@@ -454,6 +462,7 @@ function removeSuggestion() {
   navItems = [];
   navIndex = -1;
   lockedResume = null;
+  pinFrames.clear();
 }
 
 function setActiveNav(i) {
@@ -718,6 +727,53 @@ async function buildLockedSuggestion(field, onUnlock) {
   Object.assign(msg.style, { padding: "8px 10px 4px", fontSize: "12px", opacity: "0.7" });
   box.appendChild(msg);
 
+  // a second prompt would invalidate the code the user is reading
+  opLog("pinbox.open", "info", { anchor: fieldInfo(field), viaGenerator: typeof onUnlock === "function" });
+  chrome.runtime
+    .sendMessage({ type: "requestChallenge", ifNeeded: true })
+    .then((r) => opLog("challenge.ifneeded.res", r?.ok ? "debug" : "warn", { ok: r?.ok, error: r?.error, state: r?.state, hasChallenge: r?.hasChallenge }))
+    .catch((e) => opLog("challenge.ifneeded.failed", "warn", { err: String(e?.message ?? e) }));
+
+  // also reached from the background's "unlocked" message via lockedResume
+  const finishUnlock = async () => {
+    lockedResume = null;
+    if (typeof onUnlock === "function") {
+      removeSuggestion();
+      onUnlock();
+      return;
+    }
+    cachedLogins = null;
+    opLog("unlock.resume", "info", { target: typeof onUnlock === "function" ? "otp" : "logins" });
+    const r2 = await chrome.runtime.sendMessage({ type: "inlineLogins" }).catch((e) => {
+      opLog("unlock.resume.failed", "warn", { err: String(e?.message ?? e) });
+      return null;
+    });
+    cachedLogins = r2?.logins || [];
+    opLog("unlock.resume.logins", "debug", { n: cachedLogins.length });
+    if (cachedLogins.length === 1) {
+      removeSuggestion();
+      fillAnchor = field;
+      fillWithAuthHint(field, chrome.runtime.sendMessage({ type: "inlineFill", loginName: cachedLogins[0], trace: opTrace }))
+        .then((r) => {
+          opLog("unlock.autofill", r?.filled ? "info" : "warn", { ok: r?.ok, filled: r?.filled, error: r?.error, reason: r?.reason });
+          if (!r?.filled) showFillError(liveField(field), fillErrorText(r, "Not filled: the password did not go in."));
+        })
+        .catch(() => {});
+    } else if (cachedLogins.length > 1) {
+      buildChooser(field, cachedLogins);
+    } else {
+      removeSuggestion();
+    }
+  };
+  lockedResume = finishUnlock;
+
+  mountPinEntry(box, field, finishUnlock);
+}
+
+// fallback when the extension iframe cannot load: the same field inside the closed
+// shadow root. Page scripts cannot reach it, but capture-phase key listeners on window
+// still see the keystrokes, which only the iframe avoids
+function mountInlinePin(box, field, finishUnlock) {
   const input = document.createElement("input");
   input.type = "text";
   input.inputMode = "numeric";
@@ -775,46 +831,6 @@ async function buildLockedSuggestion(field, onUnlock) {
   });
   box.appendChild(again);
 
-  // a second prompt would invalidate the code the user is reading
-  opLog("pinbox.open", "info", { anchor: fieldInfo(field), viaGenerator: typeof onUnlock === "function" });
-  chrome.runtime
-    .sendMessage({ type: "requestChallenge", ifNeeded: true })
-    .then((r) => opLog("challenge.ifneeded.res", r?.ok ? "debug" : "warn", { ok: r?.ok, error: r?.error, state: r?.state, hasChallenge: r?.hasChallenge }))
-    .catch((e) => opLog("challenge.ifneeded.failed", "warn", { err: String(e?.message ?? e) }));
-
-  // also reached from the background's "unlocked" message via lockedResume
-  const finishUnlock = async () => {
-    lockedResume = null;
-    if (typeof onUnlock === "function") {
-      removeSuggestion();
-      onUnlock();
-      return;
-    }
-    cachedLogins = null;
-    opLog("unlock.resume", "info", { target: typeof onUnlock === "function" ? "otp" : "logins" });
-    const r2 = await chrome.runtime.sendMessage({ type: "inlineLogins" }).catch((e) => {
-      opLog("unlock.resume.failed", "warn", { err: String(e?.message ?? e) });
-      return null;
-    });
-    cachedLogins = r2?.logins || [];
-    opLog("unlock.resume.logins", "debug", { n: cachedLogins.length });
-    if (cachedLogins.length === 1) {
-      removeSuggestion();
-      fillAnchor = field;
-      fillWithAuthHint(field, chrome.runtime.sendMessage({ type: "inlineFill", loginName: cachedLogins[0], trace: opTrace }))
-        .then((r) => {
-          opLog("unlock.autofill", r?.filled ? "info" : "warn", { ok: r?.ok, filled: r?.filled, error: r?.error, reason: r?.reason });
-          if (!r?.filled) showFillError(liveField(field), fillErrorText(r, "Not filled: the password did not go in."));
-        })
-        .catch(() => {});
-    } else if (cachedLogins.length > 1) {
-      buildChooser(field, cachedLogins);
-    } else {
-      removeSuggestion();
-    }
-  };
-  lockedResume = finishUnlock;
-
   let verifying = false;
   const doVerify = async () => {
     if (verifying) return;
@@ -863,6 +879,50 @@ async function buildLockedSuggestion(field, onUnlock) {
   }
 
   setTimeout(() => input.focus(), 0);
+}
+
+// the pairing code is typed into an extension iframe, so no listener of the page sees
+// it. use_dynamic_url keeps the frame's URL unguessable; if the frame does not report
+// ready (blocked, or getURL handed out an address that no longer works), fall back
+const PIN_FRAME_READY_MS = 2000;
+const pinFrames = new Map();
+function mountPinEntry(box, field, finishUnlock) {
+  const nonce = Array.from(crypto.getRandomValues(new Uint8Array(12)), (b) => b.toString(16).padStart(2, "0")).join("");
+  const frame = document.createElement("iframe");
+  frame.src = `${chrome.runtime.getURL("src/pin.html")}#${nonce}`;
+  frame.title = "Code shown on your Mac";
+  frame.setAttribute("allowtransparency", "true");
+  Object.assign(frame.style, {
+    display: "block",
+    width: "100%",
+    height: "104px",
+    border: "0",
+    background: "transparent",
+    colorScheme: "light dark",
+  });
+  box.appendChild(frame);
+  positionBox();
+  const fallback = () => {
+    if (!pinFrames.has(nonce)) return;
+    pinFrames.delete(nonce);
+    frame.remove();
+    if (!box.isConnected) return;
+    opLog("pinbox.frame.fallback", "warn", { why: "frame did not report ready", ms: PIN_FRAME_READY_MS });
+    mountInlinePin(box, field, finishUnlock);
+    positionBox();
+  };
+  const timer = setTimeout(fallback, PIN_FRAME_READY_MS);
+  pinFrames.set(nonce, {
+    ready() {
+      clearTimeout(timer);
+      opLog("pinbox.frame.ready", "debug", {});
+      frame.focus();
+    },
+    close() {
+      removeSuggestion();
+      liveField(field)?.focus();
+    },
+  });
 }
 
 function isNewPasswordField(el) {
@@ -1472,7 +1532,13 @@ document.addEventListener(
   (e) => {
     if (!suggestionEl || e.target !== anchorField) return;
     if (e.relatedTarget && suggestionEl.contains(e.relatedTarget)) return;
-    removeSuggestion();
+    // focus moving into the PIN iframe arrives without a relatedTarget; only once it
+    // has landed does activeElement show it is inside our box
+    setTimeout(() => {
+      if (suggestionEl && document.activeElement === suggestionEl) return;
+      if (suggestionEl && anchorField && document.activeElement === anchorField) return;
+      removeSuggestion();
+    }, 0);
   },
   true,
 );
