@@ -356,15 +356,25 @@ function fillErrorText(res) {
   return err ? `Not filled: ${err}` : "Not filled.";
 }
 
+// unlocking from the popup renders twice at once (the verify reply and the state
+// broadcast); both cleared the list and then appended, which doubled every login.
+// Only the newest render may touch the list.
+let loginsGen = 0;
+let codesGen = 0;
+const NOLOGINS_TEXT = document.getElementById("nologins").textContent;
+
 async function renderLogins() {
+  const gen = ++loginsGen;
   const tab = await activeTab();
   document.getElementById("site").textContent = tab?.url ? new URL(tab.url).hostname : "";
   const list = document.getElementById("logins");
   const none = document.getElementById("nologins");
-  list.innerHTML = "";
-  none.hidden = true;
 
   const res = await send({ type: "getLogins", tabId: tab.id, url: tab.url });
+  if (gen !== loginsGen) return;
+  list.replaceChildren();
+  none.hidden = true;
+  none.textContent = NOLOGINS_TEXT;
   if (!res?.ok) {
     none.hidden = false;
     const err = String(res?.error || "");
@@ -406,10 +416,12 @@ async function renderLogins() {
 }
 
 async function renderCodes() {
+  const gen = ++codesGen;
   const list = document.getElementById("codes");
-  list.innerHTML = "";
-  list.hidden = true;
   const res = await send({ type: "getOneTimeCodes" });
+  if (gen !== codesGen) return;
+  list.replaceChildren();
+  list.hidden = true;
   if (!res?.ok || !res.rows?.length) return;
   for (const row of res.rows) {
     const li = document.createElement("li");

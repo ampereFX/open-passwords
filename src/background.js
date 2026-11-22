@@ -248,24 +248,43 @@ function queuePendingSave(save) {
   const k = `${save.host} ${(save.detected || "").toLowerCase()}`;
   const i = pendingSaves.findIndex((p) => `${p.host} ${(p.detected || "").toLowerCase()}` === k);
   if (i >= 0) pendingSaves.splice(i, 1);
-  pendingSaves.push(save);
+  pendingSaves.push({ at: Date.now(), ...save });
   while (pendingSaves.length > 10) pendingSaves.shift();
 }
+// a save that failed while flushing used to vanish without a trace. it is logged and
+// kept for the next unlock (two tries in all); the plaintext never outlives 30 minutes
+const PENDING_SAVE_TTL_MS = 30 * 60_000;
+const PENDING_SAVE_TRIES = 2;
 async function flushPendingSaves() {
   if (!client.ready || !pendingSaves.length) return;
   const batch = pendingSaves.splice(0);
   for (const s of batch) {
+    const age = Date.now() - (s.at || 0);
+    if (age > PENDING_SAVE_TTL_MS) {
+      logUp("save.pending.expired", "warn", { host: s.host, user: maskUser(s.detected), ageMin: Math.round(age / 60_000) });
+      continue;
+    }
+    let existing = [];
     try {
-      let existing = [];
-      try {
-        existing = (await client.getLoginNamesForURL(s.tabId, s.frameUrl))
-          .map((l) => l.username)
-          .filter(Boolean);
-      } catch {}
-      const target = pickSaveTarget({ ...s, existing });
-      if (target === null) continue;
+      existing = (await client.getLoginNamesForURL(s.tabId, s.frameUrl)).map((l) => l.username).filter(Boolean);
+    } catch (e) {
+      // same consequence as in resolveSave: the decision then looks like a first login
+      logUp("save.pending.existing.failed", "warn", { host: s.host, err: errInfo(e) });
+    }
+    const target = pickSaveTarget({ ...s, existing });
+    if (target === null) {
+      logUp("save.pending.skip", "info", { host: s.host, user: maskUser(s.detected) });
+      continue;
+    }
+    try {
       await client.saveLogin(s.tabId, s.frameUrl, target, s.password);
-    } catch {}
+      logUp("save.pending.done", "info", { host: s.host, target: target ? maskUser(target) : "(ask)" });
+    } catch (e) {
+      const tries = (s.tries || 0) + 1;
+      const keep = tries < PENDING_SAVE_TRIES;
+      logUp("save.pending.failed", "warn", { host: s.host, err: errInfo(e), tries, kept: keep });
+      if (keep) queuePendingSave({ ...s, tries });
+    }
   }
 }
 
@@ -289,7 +308,21 @@ function uniqueByUsername(logins) {
   });
 }
 
+// refresh re-fills only the page that was filled: same host alone also matched a
+// "change password" page later in the same tab, which then got the old password
 const lastFillByTab = new Map();
+function pageKey(u) {
+  try {
+    const x = new URL(u);
+    return `${x.origin}${x.pathname}`;
+  } catch {
+    return null;
+  }
+}
+chrome.tabs?.onRemoved?.addListener((tabId) => {
+  lastFillByTab.delete(tabId);
+  otpForgetTab(tabId);
+});
 
 // a second Fill click while macOS is still asking for Touch ID would queue a second
 // prompt behind the first; share the read that is already waiting instead
@@ -679,7 +712,7 @@ chrome.runtime.onMessage.addListener((msg, sender, rawRespond) => {
             );
             if (filled) {
               recordMru(host, cred.username);
-              lastFillByTab.set(sender.tab.id, { host, username: cred.username });
+              lastFillByTab.set(sender.tab.id, { host, username: cred.username, page: pageKey(sender.tab.url) });
             }
           }
           // a reason the content script can turn into a visible message instead of a silent no-op
@@ -953,7 +986,7 @@ chrome.runtime.onMessage.addListener((msg, sender, rawRespond) => {
             );
             if (filled) {
               recordMru(host, cred.username);
-              lastFillByTab.set(tab.id, { host, username: cred.username });
+              lastFillByTab.set(tab.id, { host, username: cred.username, page: pageKey(tab.url) });
             }
           }
           let reason;
@@ -972,13 +1005,15 @@ chrome.runtime.onMessage.addListener((msg, sender, rawRespond) => {
           const tab = await activeTab();
           const entry = tab?.id != null ? lastFillByTab.get(tab.id) : null;
           const host = tab?.url ? registrableHost(tab.url) : null;
-          if (!entry || !host || entry.host !== host) {
+          const samePage = !!entry && entry.page === pageKey(tab?.url);
+          if (!entry || !host || entry.host !== host || !samePage) {
             logUp("popup.refill.skip", "debug", {
               hasEntry: !!entry,
               host,
               entryHost: entry?.host,
-              why: !entry ? "nothing filled in this tab" : "host changed",
+              why: !entry ? "nothing filled in this tab" : entry.host !== host ? "host changed" : "page changed",
             }, { trace, ctx });
+            if (entry && !samePage) lastFillByTab.delete(tab.id);
             return sendResponse({ ok: true, refilled: false });
           }
           try {

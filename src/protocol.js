@@ -25,6 +25,13 @@ const AUTH_TIMEOUT_MS = 90_000;
 // how long a lookup waits for its turn before reporting "busy" instead of hanging
 const LOCK_WAIT_MS = 10_000;
 
+// wording matches the UI's "locked" mapping (/not unlocked|locked/)
+function sessionEndedError() {
+  const e = new Error("the vault locked while this was running, unlock it again");
+  e.code = "session_ended";
+  return e;
+}
+
 // callers show "new code" wording for this, retyping the old code can never work
 function challengeError(message) {
   const e = new Error(message);
@@ -563,20 +570,26 @@ export class ApplePasswords {
   }
 
   async _encryptedQuery(cmd, tabId, hostname, payloadBody, timeoutMs, frameId = 0) {
-    const sdata = this.session.serialize(await this.session.encrypt(payloadBody));
+    // ready was checked before queueing; the session can have ended (sleep, lock,
+    // disconnect) while this request waited for its turn or for its reply. Without
+    // these checks that surfaced as "Cannot read properties of undefined".
+    if (!this.ready) throw sessionEndedError();
+    const session = this.session;
+    const sdata = session.serialize(await session.encrypt(payloadBody));
     const body = {
       tabId,
       frameId,
-      payload: { QID: QueryId[cmd], SMSG: JSON.stringify({ TID: this.session.username, SDATA: sdata }) },
+      payload: { QID: QueryId[cmd], SMSG: JSON.stringify({ TID: session.username, SDATA: sdata }) },
     };
     // one-time-code queries carry their URLs inside the encrypted body
     if (hostname != null) body.url = hostname;
     const reply = await this._send(cmd, body, timeoutMs);
+    if (this.session !== session || session.sharedKey === undefined) throw sessionEndedError();
 
     let smsg = reply.payload.SMSG;
     if (typeof smsg === "string") smsg = JSON.parse(smsg);
-    if (smsg.TID !== this.session.username) throw new Error("response for another session");
-    const data = await this.session.decrypt(this.session.deserialize(smsg.SDATA));
+    if (smsg.TID !== session.username) throw new Error("response for another session");
+    const data = await session.decrypt(session.deserialize(smsg.SDATA));
     return JSON.parse(bytesToUtf8(data));
   }
 

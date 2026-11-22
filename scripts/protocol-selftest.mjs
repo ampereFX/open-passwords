@@ -249,5 +249,26 @@ function fakeSession() {
   delete globalThis.chrome;
 }
 
+// the session ends while a query waits for its reply: a clear error, not a TypeError
+{
+  const c = new ApplePasswords();
+  c.port = { postMessage() {} };
+  c.capabilities = {};
+  const sess = fakeSession();
+  sess.sharedKey = 7n;
+  sess.encrypt = async () => new Uint8Array([1]);
+  c.session = sess;
+  c.state = State.Unlocked;
+  const q = settle(c._encryptedQuery(Command.GET_LOGIN_NAMES_FOR_URL, 1, "example.com", {}, null));
+  await sleep(5);
+  c.session = undefined;
+  c._dispatch({ cmd: Command.GET_LOGIN_NAMES_FOR_URL, payload: { SMSG: "{}" } });
+  const r = await q;
+  check("session ended mid-query: clear error", !r.ok && r.e.code === "session_ended", r.e?.message);
+  c.state = State.NeedsPin;
+  const r2 = await settle(c._encryptedQuery(Command.GET_LOGIN_NAMES_FOR_URL, 1, "example.com", {}, null));
+  check("query after lock: clear error", !r2.ok && r2.e.code === "session_ended", r2.e?.message);
+}
+
 console.log(`protocol self-test: ${passed} passed, ${failed} failed`);
 if (failed) process.exit(1);
