@@ -60,6 +60,10 @@ renderPmToggle();
 // a user defaults write isnt a forced policy, only a config profile approved once in System Settings is
 const policyToggle = document.getElementById("policy-toggle");
 const policyNote = document.getElementById("policy-note");
+const policyHelp = document.getElementById("policy-help");
+const POLICY_NOTE = policyNote.textContent;
+const browserName = navigator.brave ? "Brave" : "the browser";
+let policyPoll = null;
 
 function policyMsg(action) {
   return new Promise((resolve) => {
@@ -74,16 +78,72 @@ function policyMsg(action) {
   });
 }
 
+// pending is "set" (waiting for the user to install the profile) or "clear" (to remove it)
+function setPolicyPending(pending) {
+  chrome.storage?.local?.set({ policyPending: pending || null });
+  if (!pending) {
+    policyHelp.hidden = true;
+    clearInterval(policyPoll);
+    policyPoll = null;
+    return;
+  }
+  const installing = pending === "set";
+  document.getElementById("policy-help-title").textContent = installing
+    ? "One more step: macOS has to approve this"
+    : "One more step: remove the profile in macOS";
+  const steps = installing
+    ? [
+        "Click Open System Settings below.",
+        "Under Downloaded, double-click “Open Passwords - Hide Browser Password Manager”.",
+        "Click Install and confirm with your Mac password or Touch ID.",
+        `Quit ${browserName} with ⌘Q and open it again.`,
+      ]
+    : [
+        "Click Open System Settings below.",
+        "Select “Open Passwords - Hide Browser Password Manager”.",
+        "Click the minus button (−) and confirm.",
+        `Quit ${browserName} with ⌘Q and open it again.`,
+      ];
+  const list = document.getElementById("policy-steps");
+  list.replaceChildren(
+    ...steps.map((t) => {
+      const li = document.createElement("li");
+      li.textContent = t;
+      return li;
+    }),
+  );
+  policyHelp.hidden = false;
+  // watch for the approval so the user never has to reopen the popup
+  if (!policyPoll) policyPoll = setInterval(checkPolicyPending, 2000);
+}
+
+async function checkPolicyPending() {
+  const { policyPending } = await chrome.storage.local.get({ policyPending: null });
+  if (!policyPending) return setPolicyPending(null);
+  const r = await policyMsg("get");
+  if (r.error || !r.ok) return;
+  const done = policyPending === "set" ? !!r.hidden : !r.hidden;
+  if (!done) return;
+  policyToggle.checked = !!r.hidden;
+  setPolicyPending(null);
+  policyNote.textContent = r.hidden
+    ? `On. Quit ${browserName} with ⌘Q and reopen it if the key icon still shows.`
+    : `Off. Quit ${browserName} with ⌘Q and reopen it to get the password manager back.`;
+}
+
 async function renderPolicyToggle() {
   const r = await policyMsg("get");
   if (r.error || !r.ok) {
     policyToggle.disabled = true;
-    policyNote.textContent = "needs the policy helper - run native/install.sh";
+    policyNote.textContent = "needs the policy helper: run native/install.sh, then restart the browser";
     return;
   }
   policyToggle.disabled = false;
   policyToggle.checked = !!r.hidden;
-  policyNote.textContent = "";
+  policyNote.textContent = POLICY_NOTE;
+  const { policyPending } = (await chrome.storage?.local?.get({ policyPending: null })) ?? {};
+  const stillPending = (policyPending === "set" && !r.hidden) || (policyPending === "clear" && r.hidden);
+  setPolicyPending(stillPending ? policyPending : null);
 }
 
 policyToggle.addEventListener("change", async () => {
@@ -92,15 +152,27 @@ policyToggle.addEventListener("change", async () => {
   const r = await policyMsg(on ? "set" : "clear");
   policyToggle.disabled = false;
   if (r.error || !r.ok) {
-    policyNote.textContent = "helper failed - run native/install.sh";
+    policyNote.textContent = "helper failed: run native/install.sh, then restart the browser";
     policyToggle.checked = !on;
     return;
   }
-  // the profile only sticks once approved, reflect the real forced state
+  // the switch shows what is really in force; the steps cover the gap until macOS agrees
   policyToggle.checked = !!r.hidden;
-  if (on && !r.hidden) policyNote.textContent = "approve the profile in System Settings, then reopen this popup";
-  else if (!on && r.hidden) policyNote.textContent = "remove the profile in System Settings, then reopen this popup";
-  else policyNote.textContent = "";
+  policyNote.textContent = POLICY_NOTE;
+  setPolicyPending(on !== !!r.hidden ? (on ? "set" : "clear") : null);
+});
+
+document.getElementById("policy-open-settings").addEventListener("click", async () => {
+  // helpers installed before 0.52 dont know "open"; their "clear" only opens the same pane
+  const r = await policyMsg("open");
+  if (r.error === "unknown action") await policyMsg("clear");
+});
+
+document.getElementById("policy-cancel").addEventListener("click", () => setPolicyPending(null));
+
+document.getElementById("open-browser-passwords").addEventListener("click", () => {
+  // chromium browsers map chrome:// to their own scheme (brave://, edge://)
+  chrome.tabs.create({ url: "chrome://password-manager/passwords" });
 });
 
 renderPolicyToggle();
@@ -108,6 +180,7 @@ renderPolicyToggle();
 // credit-card autofill stays untouched so google pay keeps working
 const afToggle = document.getElementById("af-toggle");
 const afNote = document.getElementById("af-note");
+const AF_NOTE = afNote.textContent;
 
 function renderAfToggle() {
   const pref = chrome.privacy?.services?.autofillAddressEnabled;
@@ -121,7 +194,7 @@ function renderAfToggle() {
       d.levelOfControl === "controllable_by_this_extension" ||
       d.levelOfControl === "controlled_by_this_extension";
     afToggle.disabled = !controllable;
-    afNote.textContent = controllable ? "" : "controlled elsewhere";
+    afNote.textContent = controllable ? AF_NOTE : "controlled elsewhere";
   });
 }
 

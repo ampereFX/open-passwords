@@ -134,6 +134,11 @@ def main():
         r = subprocess.run(["open", "x-apple.systempreferences:com.apple.preferences.configurationprofiles"])
         log(f"open profiles pane rc={r.returncode}")
         send({"ok": True, "hidden": is_forced(), "forcedBundles": forced_bundles()})
+    elif action == "open":
+        # the walk-through in the popup sends the user here to install the profile
+        r = subprocess.run(["open", "x-apple.systempreferences:com.apple.preferences.configurationprofiles"])
+        log(f"open profiles pane rc={r.returncode}")
+        send({"ok": True, "hidden": is_forced(), "forcedBundles": forced_bundles()})
     elif action == "get":
         send({"ok": True, "hidden": bool(forced), "forcedBundles": forced})
     else:

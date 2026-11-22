@@ -63,11 +63,24 @@
         <input type="checkbox" id="pm-toggle" class="switch" />
       </label>
       <label id="policy-row" class="switch-row">
-        <span>Hide browser password manager entirely<span id="policy-note" class="subnote"></span></span>
+        <span>Turn off browser password manager<span id="policy-note" class="subnote">stops saving and the key icon, needs a one-time macOS approval</span></span>
         <input type="checkbox" id="policy-toggle" class="switch" />
       </label>
+      <!-- the profile only takes effect after the user installs it, so walk them through it -->
+      <div id="policy-help" class="help-box" hidden>
+        <p id="policy-help-title" class="help-title"></p>
+        <ol id="policy-steps" class="help-steps"></ol>
+        <div class="help-actions">
+          <button id="policy-open-settings" class="link">Open System Settings</button>
+          <button id="policy-cancel" class="link">Cancel</button>
+        </div>
+      </div>
+      <p class="subnote help-aside">
+        Logins already saved in the browser still show up in its own dropdown.
+        <button id="open-browser-passwords" class="link inline">Delete them here</button>
+      </p>
       <label id="af-row" class="switch-row" hidden>
-        <span>Hide browser autofill suggestions<span id="af-note" class="subnote"></span></span>
+        <span>Hide browser autofill suggestions<span id="af-note" class="subnote">remembered emails, names and addresses</span></span>
         <input type="checkbox" id="af-toggle" class="switch" />
       </label>
       <label id="pk-row" class="switch-row">
