@@ -367,7 +367,14 @@ async function renderLogins() {
   const res = await send({ type: "getLogins", tabId: tab.id, url: tab.url });
   if (!res?.ok) {
     none.hidden = false;
-    none.textContent = res?.error ?? "Couldn't load logins.";
+    const err = String(res?.error || "");
+    none.textContent = /busy/i.test(err)
+      ? "Waiting on a macOS prompt (Touch ID or password). Confirm it, then press refresh."
+      : /timeout/i.test(err)
+        ? "Apple's helper did not answer. Press refresh to try again."
+        : /not unlocked|locked/i.test(err)
+          ? "Locked again. Reopen this popup to get a new code."
+          : `Couldn't load logins${err ? `: ${err}` : "."} Press refresh to try again.`;
     return;
   }
   if (!res.logins.length) {

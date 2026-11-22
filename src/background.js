@@ -568,7 +568,8 @@ chrome.runtime.onMessage.addListener((msg, sender, rawRespond) => {
           } catch (e) {
             // this used to surface as "no saved passwords" with no hint that the query failed
             logUp("fill.logins.failed", "warn", { err: errInfo(e), state: client.state }, { trace, ctx });
-            sendResponse({ ok: true, locked: false, logins: [] });
+            // failed, not empty: the dropdown says so instead of silently not appearing
+            sendResponse({ ok: true, locked: !client.ready, logins: [], failed: !!client.ready, error: String(e?.message ?? e), code: e?.code });
           }
           break;
         }

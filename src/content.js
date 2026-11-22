@@ -4,7 +4,7 @@
 // A classic content script cannot import log.js, so this is a thin producer: it posts
 // events to the worker, which owns the buffer and applies the redaction whitelist.
 // Never put a field value in here, only shape, counts and decisions.
-const OP_BUILD = "0.55.0";
+const OP_BUILD = "0.56.0";
 let opTraceSeq = 0;
 let opTrace = "boot";
 let opQueue = [];
@@ -211,17 +211,28 @@ function fillCredentials(username, password, anchor, report = {}) {
     for (const i of root.querySelectorAll("input")) pool.add(i);
   }
   const all = Array.from(pool);
-  const inputs = all.filter(isFillable);
+  const fillable = all.filter(isFillable);
+
+  // A display:none field is fine inside the form the user is logging in with (the
+  // two-step pattern: password hidden until "Next"). Anywhere else on the page it is
+  // the shape of an injected form (forum posts, ads) waiting to read the value, and
+  // with no anchor (popup Fill) the first password on the page used to be one of those.
+  const loginForm =
+    anchor?.form ||
+    (!anchor && fillable.find((i) => isVisible(i) && (isPasswordField(i) || isUsernameField(i)) && i.form)?.form) ||
+    null;
+  const inputs = fillable.filter((i) => isVisible(i) || (loginForm && i.form === loginForm));
   let passwords = inputs.filter(isPasswordField);
   let usernames = inputs.filter(isUsernameField);
 
   report.inputs = all.length;
-  report.fillable = inputs.length;
+  report.fillable = fillable.length;
+  report.hiddenSkipped = fillable.length - inputs.length;
   report.passwords = passwords.length;
   report.usernames = usernames.length;
   report.hiddenPw = passwords.filter((p) => !isVisible(p)).length;
 
-  const anchorForm = anchor && anchor.form;
+  const anchorForm = loginForm;
   report.anchor = anchor ? fieldInfo(anchor) : null;
   report.anchorForm = !!anchorForm;
   if (anchorForm) {
@@ -231,6 +242,12 @@ function fillCredentials(username, password, anchor, report = {}) {
     if (userInForm.length) usernames = userInForm;
     report.passwordsInForm = passwords.length;
   }
+
+  // a visible field always wins over a hidden one, so "filled" means the user can see it
+  const visiblePw = passwords.filter(isVisible);
+  if (visiblePw.length) passwords = visiblePw;
+  const visibleUser = usernames.filter(isVisible);
+  if (visibleUser.length) usernames = visibleUser;
 
   let firstPw = passwords[0];
   if (anchor && passwords.length > 1) {
@@ -923,6 +940,31 @@ function fillGeneratedPassword(field, pw) {
   lastGenerated = { host: location.hostname, password: pw, at: Date.now() };
 }
 
+function lookupFailedText(res) {
+  const err = String(res?.error || "");
+  if (res?.code === "busy" || /busy/i.test(err)) return "Waiting on a macOS prompt (Touch ID or password)";
+  if (/timeout/i.test(err)) return "Apple's helper did not answer";
+  if (!res) return "Lost contact with the extension";
+  return "Couldn't load your logins";
+}
+
+function appendLookupFailedRow(box, field, res) {
+  const row = document.createElement("div");
+  Object.assign(row.style, { padding: "8px 12px", cursor: "pointer" });
+  const title = document.createElement("div");
+  title.textContent = lookupFailedText(res);
+  Object.assign(title.style, { fontSize: "12px", opacity: "0.75" });
+  const action = document.createElement("div");
+  action.textContent = "Retry";
+  Object.assign(action.style, { fontWeight: "600", marginTop: "2px" });
+  row.append(title, action);
+  registerRow(row, () => {
+    opLog("offer.retry", "info", { anchor: fieldInfo(field) });
+    buildOfferSuggestion(liveField(field));
+  });
+  box.appendChild(row);
+}
+
 // fill routes through the origin-checked background path, page never sees the password
 function appendLoginRows(box, field, logins) {
   for (const login of logins) {
@@ -1028,17 +1070,28 @@ async function buildOfferSuggestion(field) {
 
   const locked = !!(res?.ok && res.locked);
   const logins = res?.ok && !locked ? res.logins || [] : [];
-  opLog("offer.fetched", "debug", {
+  // the lookup itself failed (busy helper, timeout, worker gone): an empty list would
+  // look like "no saved logins here", which is how entries seemed to vanish
+  const failed = !res || res.ok === false || !!res.failed;
+  opLog("offer.fetched", failed ? "warn" : "debug", {
     ok: res?.ok,
     locked,
+    failed,
     logins: logins.length,
     generator: hasGenerator,
     error: res?.error,
-    willShow: !!(locked || logins.length || hasGenerator),
+    willShow: !!(locked || failed || logins.length || hasGenerator),
   }, { trace });
-  if (!locked && !logins.length && !hasGenerator) return;
+  if (!locked && !failed && !logins.length && !hasGenerator) return;
 
   const box = buildSuggestionBox(field);
+  if (failed) {
+    appendLookupFailedRow(box, field, res);
+    if (hasGenerator) appendGeneratorOptions(box, field, true);
+    positionBox();
+    opLog("offer.shown", "debug", { mode: "failed", rows: box.children.length }, { trace });
+    return;
+  }
   if (locked) {
     const row = document.createElement("div");
     row.textContent = "Unlock to autofill…";
